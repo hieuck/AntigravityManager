@@ -16,6 +16,7 @@ export interface CloudTokenData {
   project_id?: string;
   oauth_client_key?: string;
   session_id?: string;
+  id_token?: string;
   upstream_proxy_url?: string;
   is_gcp_tos?: boolean;
 }
@@ -71,6 +72,7 @@ export const CloudTokenDataSchema = z.object({
   project_id: z.string().optional(),
   oauth_client_key: z.string().optional(),
   session_id: z.string().optional(),
+  id_token: z.string().optional(),
   upstream_proxy_url: z.string().optional(),
   is_gcp_tos: z.boolean().optional(),
 });

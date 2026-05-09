@@ -1052,6 +1052,14 @@ export class CloudAccountRepo {
     return row?.value ?? null;
   }
 
+  private static shouldWriteGcpTos(account: CloudAccount): boolean {
+    if (account.token.oauth_client_key === 'antigravity_enterprise') {
+      return false;
+    }
+
+    return account.token.is_gcp_tos ?? false;
+  }
+
   private static injectNewFormat(
     orm: BetterSQLite3Database<typeof drizzleSchema>,
     account: CloudAccount,
@@ -1060,7 +1068,9 @@ export class CloudAccountRepo {
       account.token.access_token,
       account.token.refresh_token,
       account.token.expiry_timestamp,
-      account.token.is_gcp_tos ?? true,
+      this.shouldWriteGcpTos(account),
+      account.token.id_token,
+      account.email,
     );
     const userStatusPayload = ProtobufUtils.createMinimalUserStatusPayload(account.email);
     const userStatusEntry = ProtobufUtils.createUnifiedStateEntry(
@@ -1078,14 +1088,9 @@ export class CloudAccountRepo {
           'enterpriseGcpProjectId',
           projectPayload,
         );
-        this.upsertItemValue(
-          tx,
-          'antigravityUnifiedStateSync.enterprisePreferences',
-          projectEntry,
-        );
+        this.upsertItemValue(tx, 'antigravityUnifiedStateSync.enterprisePreferences', projectEntry);
       } else {
-        tx
-          .delete(itemTable)
+        tx.delete(itemTable)
           .where(eq(itemTable.key, 'antigravityUnifiedStateSync.enterprisePreferences'))
           .run();
       }
@@ -1142,21 +1147,24 @@ export class CloudAccountRepo {
     });
   }
 
-  private static detectFormatCapability(db: DrizzleExecutor): 'new' | 'old' | null {
+  private static detectFormatCapability(db: DrizzleExecutor): 'new' | 'old' | 'dual' | null {
     const unifiedValue = this.getItemValue(
       db,
       'antigravityUnifiedStateSync.oauthToken',
       'ide.itemTable.antigravityUnifiedStateSync.oauthToken',
     );
-    if (unifiedValue) {
-      return 'new';
-    }
-
     const oldValue = this.getItemValue(
       db,
       'jetskiStateSync.agentManagerInitState',
       'ide.itemTable.jetskiStateSync.agentManagerInitState',
     );
+
+    if (unifiedValue && oldValue) {
+      return 'dual';
+    }
+    if (unifiedValue) {
+      return 'new';
+    }
     if (oldValue) {
       return 'old';
     }
@@ -1307,6 +1315,7 @@ export class CloudAccountRepo {
   private static readTokenInfoFromDb(db: DrizzleExecutor): {
     accessToken: string;
     refreshToken: string;
+    idToken?: string;
     projectId?: string;
   } {
     const enterpriseProjectId = this.readEnterpriseProjectIdFromDb(db);
@@ -1316,7 +1325,7 @@ export class CloudAccountRepo {
       'ide.itemTable.antigravityUnifiedStateSync.oauthToken',
     );
 
-    let tokenInfo: { accessToken: string; refreshToken: string } | null = null;
+    let tokenInfo: { accessToken: string; refreshToken: string; idToken?: string } | null = null;
     if (unifiedValue) {
       try {
         const unifiedBuffer = Buffer.from(unifiedValue, 'base64');
@@ -1362,6 +1371,7 @@ export class CloudAccountRepo {
   private static readTokenInfoWithRetry(dbPath: string): {
     accessToken: string;
     refreshToken: string;
+    idToken?: string;
     projectId?: string;
   } {
     let lastError: unknown;
@@ -1469,7 +1479,8 @@ export class CloudAccountRepo {
           token_type: 'Bearer',
           email: userInfo.email,
           project_id: tokenInfo.projectId,
-          is_gcp_tos: true,
+          is_gcp_tos: false,
+          id_token: tokenInfo.idToken,
         },
         created_at: now,
         last_used: now,
@@ -1501,7 +1512,8 @@ export class CloudAccountRepo {
           token_type: 'Bearer',
           email: userInfo.email,
           project_id: existingProjectId || tokenInfo.projectId,
-          is_gcp_tos: existing.token.is_gcp_tos ?? true,
+          is_gcp_tos: existing.token.is_gcp_tos ?? false,
+          id_token: tokenInfo.idToken ?? existing.token.id_token,
         };
       }
 

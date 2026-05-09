@@ -9,9 +9,9 @@ import {
   resolveLocalInstalledVersion,
 } from '@/server/modules/proxy/request-user-agent';
 import { isEmpty, isNumber, isString, isUndefined } from 'lodash-es';
+import { v4 } from 'uuid';
 
 // --- Constants & Config ---
-
 const CLIENT_ID = '1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com';
 const CLIENT_SECRET = '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';
 const OAUTH_CLIENTS_ENV = 'ANTIGRAVITY_OAUTH_CLIENTS';
@@ -32,9 +32,6 @@ const QUOTA_API_ENDPOINTS = [
   'https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels',
   'https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels',
 ] as const;
-
-// Internal API masquerading
-const USER_AGENT = 'antigravity/1.11.3 Darwin/arm64';
 
 // Request timeout in milliseconds (30 seconds)
 const REQUEST_TIMEOUT_MS = 30000;
@@ -218,6 +215,7 @@ export interface TokenResponse {
   expires_in: number;
   token_type: string;
   refresh_token?: string;
+  id_token?: string;
   scope?: string;
   oauth_client_key?: string;
 }
@@ -617,13 +615,14 @@ export class GoogleAPIService {
     const redirectUri = AuthServer.getRedirectUri();
 
     const params = new URLSearchParams({
+      access_type: 'offline',
+      scope: scopes,
+      prompt: 'consent',
+      response_type: 'code',
       client_id: oauthClient.client_id,
       redirect_uri: redirectUri,
-      response_type: 'code',
-      scope: scopes,
-      access_type: 'offline',
-      prompt: 'consent',
       include_granted_scopes: 'true',
+      state: v4(),
     });
 
     return `${URLS.AUTH}?${params.toString()}`;
@@ -898,9 +897,42 @@ export class GoogleAPIService {
 
       const fallbackData = (await fallbackResponse.json()) as LoadProjectResponse;
       return extractAiCreditsFromProjectContext(fallbackData);
-    } catch (e) {
+    } catch {
       return null;
     }
+  }
+
+  private static toQuotaData(
+    data: FetchModelsResponse,
+    subscriptionTier: string | undefined,
+  ): QuotaData {
+    const result: QuotaData = {
+      models: {},
+      subscription_tier: subscriptionTier,
+      is_forbidden: false,
+    };
+
+    for (const [modelName, modelInfoRaw] of Object.entries(data.models || {})) {
+      const modelQuota = toModelQuotaInfo(modelName, modelInfoRaw);
+      if (modelQuota) {
+        result.models[modelName] = modelQuota;
+      }
+    }
+
+    const modelForwardingRules = toModelForwardingRules(data.deprecatedModelIds);
+    if (modelForwardingRules) {
+      result.model_forwarding_rules = modelForwardingRules;
+    }
+
+    return result;
+  }
+
+  private static shouldFallbackQuotaEndpoint(status: number): boolean {
+    return status === 429 || status >= 500;
+  }
+
+  private static isPermanentQuotaHttp4xx(errorMsg: string): boolean {
+    return /^HTTP 4\d{2}\b/.test(errorMsg) && !errorMsg.startsWith('HTTP 429');
   }
 
   /**
@@ -916,87 +948,82 @@ export class GoogleAPIService {
     for (let endpointIndex = 0; endpointIndex < QUOTA_API_ENDPOINTS.length; endpointIndex++) {
       const endpoint = QUOTA_API_ENDPOINTS[endpointIndex];
       const hasNextEndpoint = endpointIndex + 1 < QUOTA_API_ENDPOINTS.length;
+      let currentPayload = { ...payload };
+      let retriedWithoutProject = false;
 
-      try {
-        const response = await fetch(endpoint, {
-          method: 'POST',
-          headers: buildInternalApiHeaders(accessToken),
-          body: JSON.stringify(payload),
-          signal: createTimeoutSignal(REQUEST_TIMEOUT_MS),
-          ...fetchOptions,
-        });
+      while (true) {
+        try {
+          const response = await fetch(endpoint, {
+            method: 'POST',
+            headers: buildInternalApiHeaders(accessToken),
+            body: JSON.stringify(currentPayload),
+            signal: createTimeoutSignal(REQUEST_TIMEOUT_MS),
+            ...fetchOptions,
+          });
 
-        if (!response.ok) {
-          const text = await response.text();
-          const status = response.status;
+          if (!response.ok) {
+            const status = response.status;
 
-          if (status === 403) {
-            throw new Error('FORBIDDEN');
+            if (status === 403) {
+              if ('project' in currentPayload && !retriedWithoutProject) {
+                logger.warn(
+                  '[GoogleAPIService] Quota API returned 403 with project ID, retrying without project ID',
+                );
+                currentPayload = {};
+                retriedWithoutProject = true;
+                continue;
+              }
+
+              throw new Error('FORBIDDEN');
+            }
+            if (status === 401) {
+              throw new Error('UNAUTHORIZED');
+            }
+
+            const text = await response.text();
+            const errorMsg = `HTTP ${status} - ${text}`;
+            if (hasNextEndpoint && this.shouldFallbackQuotaEndpoint(status)) {
+              logger.warn(
+                `[GoogleAPIService] Quota API ${endpoint} returned ${status}, falling back to next endpoint`,
+              );
+              lastError = new Error(errorMsg);
+
+              await sleep(1000);
+              break;
+            }
+
+            throw new Error(errorMsg);
           }
-          if (status === 401) {
-            throw new Error('UNAUTHORIZED');
-          }
 
-          const errorMsg = `HTTP ${status} - ${text}`;
-          if (hasNextEndpoint && (status === 429 || status >= 500)) {
-            logger.warn(
-              `[GoogleAPIService] Quota API ${endpoint} returned ${status}, falling back to next endpoint`,
+          const data = (await response.json()) as FetchModelsResponse;
+          const result = this.toQuotaData(data, subscriptionTier);
+
+          if (endpointIndex > 0) {
+            logger.info(
+              `[GoogleAPIService] Quota API fallback succeeded at endpoint #${endpointIndex + 1}`,
             );
-            lastError = new Error(errorMsg);
+          }
 
+          return result;
+        } catch (error: unknown) {
+          const errorMsg = error instanceof Error ? error.message : String(error);
+          lastError = error instanceof Error ? error : new Error(String(error));
+
+          // Abort retries for auth errors
+          if (errorMsg === 'FORBIDDEN' || errorMsg === 'UNAUTHORIZED') {
+            throw error;
+          }
+
+          if (hasNextEndpoint && !this.isPermanentQuotaHttp4xx(errorMsg)) {
+            logger.warn(
+              `[GoogleAPIService] Quota API request failed at ${endpoint}: ${errorMsg}. Falling back to next endpoint`,
+            );
             await sleep(1000);
-            continue;
+            break;
           }
 
-          throw new Error(errorMsg);
+          throw lastError;
         }
-
-        const data = (await response.json()) as FetchModelsResponse;
-        const result: QuotaData = {
-          models: {},
-          subscription_tier: subscriptionTier,
-          is_forbidden: false,
-        };
-
-        for (const [modelName, modelInfoRaw] of Object.entries(data.models || {})) {
-          const modelQuota = toModelQuotaInfo(modelName, modelInfoRaw);
-          if (modelQuota) {
-            result.models[modelName] = modelQuota;
-          }
-        }
-
-        const modelForwardingRules = toModelForwardingRules(data.deprecatedModelIds);
-        if (modelForwardingRules) {
-          result.model_forwarding_rules = modelForwardingRules;
-        }
-
-        if (endpointIndex > 0) {
-          logger.info(
-            `[GoogleAPIService] Quota API fallback succeeded at endpoint #${endpointIndex + 1}`,
-          );
-        }
-
-        return result;
-      } catch (error: unknown) {
-        const errorMsg = error instanceof Error ? error.message : String(error);
-        lastError = error instanceof Error ? error : new Error(String(error));
-        const isPermanentHttp4xx =
-          /^HTTP 4\d{2}\b/.test(errorMsg) && !errorMsg.startsWith('HTTP 429');
-
-        // Abort retries for auth errors
-        if (errorMsg === 'FORBIDDEN' || errorMsg === 'UNAUTHORIZED') {
-          throw error;
-        }
-
-        if (hasNextEndpoint && !isPermanentHttp4xx) {
-          logger.warn(
-            `[GoogleAPIService] Quota API request failed at ${endpoint}: ${errorMsg}. Falling back to next endpoint`,
-          );
-          await sleep(1000);
-          continue;
-        }
-
-        throw lastError;
       }
     }
 

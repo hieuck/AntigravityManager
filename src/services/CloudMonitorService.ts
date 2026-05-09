@@ -1,9 +1,10 @@
 import { Notification } from 'electron';
 import { CloudAccountRepo } from '../ipc/database/cloudHandler';
-import { GoogleAPIService } from './GoogleAPIService';
+import { GoogleAPIService, type TokenResponse } from './GoogleAPIService';
 import { AutoSwitchService } from './AutoSwitchService';
 import { logger } from '../utils/logger';
 import { classifyAccountStatusFromError } from '../utils/account-status';
+import type { CloudAccount } from '../types/cloudAccount';
 
 type CloudMonitorLanguage = 'en' | 'zh-CN' | 'ru' | 'vi';
 
@@ -53,6 +54,25 @@ function hasReusableCachedQuota(account: {
     return false;
   }
   return Object.keys(account.quota.models).length > 0;
+}
+
+function mergeRefreshedToken(
+  currentToken: CloudAccount['token'],
+  newToken: TokenResponse,
+  now: number,
+): CloudAccount['token'] {
+  return {
+    ...currentToken,
+    access_token: newToken.access_token,
+    refresh_token: newToken.refresh_token ?? currentToken.refresh_token,
+    expires_in: newToken.expires_in,
+    expiry_timestamp: now + newToken.expires_in,
+    id_token: newToken.id_token ?? currentToken.id_token,
+    oauth_client_key: GoogleAPIService.normalizeRefreshedOAuthClientKey(
+      currentToken,
+      newToken.oauth_client_key,
+    ),
+  };
 }
 
 export class CloudMonitorService {
@@ -159,13 +179,7 @@ export class CloudMonitorService {
                 account.proxy_url,
                 account.token.oauth_client_key,
               );
-              account.token.access_token = newToken.access_token;
-              account.token.expires_in = newToken.expires_in;
-              account.token.expiry_timestamp = now + newToken.expires_in;
-              account.token.oauth_client_key = GoogleAPIService.normalizeRefreshedOAuthClientKey(
-                account.token,
-                newToken.oauth_client_key,
-              );
+              account.token = mergeRefreshedToken(account.token, newToken, now);
               await CloudAccountRepo.updateToken(account.id, account.token);
               accessToken = newToken.access_token;
             } catch (refreshError) {

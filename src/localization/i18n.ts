@@ -2,6 +2,7 @@ import i18n from 'i18next';
 import { initReactI18next } from 'react-i18next';
 import LanguageDetector from 'i18next-browser-languagedetector';
 import vi from './vi';
+import tr from './tr';
 
 i18n
   .use(LanguageDetector)
@@ -13,7 +14,7 @@ i18n
       caches: ['localStorage'],
       lookupLocalStorage: 'lang',
     },
-    supportedLngs: ['en', 'zh-CN', 'ru', 'vi'],
+    supportedLngs: ['en', 'zh-CN', 'ru', 'vi', 'tr'],
     load: 'currentOnly', // Only load the exact language code, not variants
     resources: {
       en: {
@@ -93,6 +94,7 @@ i18n
               chinese: 'Chinese (Simplified)',
               russian: 'Russian',
               vietnamese: 'Vietnamese',
+              turkish: 'Turkish',
             },
             about: {
               title: 'About',
@@ -328,6 +330,7 @@ i18n
               proxySaved: 'Proxy saved',
               noProxy: 'No proxy',
               aiCredits: 'AI Credits',
+              aiCreditsValue: '{{amount}} credits',
               creditsExpiry: 'expires {{date}}',
               modelVisibility: 'Model Visibility',
             },
@@ -391,7 +394,7 @@ i18n
               updateSettingsFailed: 'Failed to update settings',
               actionFailed: 'Action failed',
               startAuthFailed: 'Failed to start sign-in flow',
-              refreshCreditsAvailable: 'AI credits: ${{amount}}',
+              refreshCreditsAvailable: 'AI credits: {{amount}}',
               refreshCreditsUnavailable: 'AI credits not available for this refresh.',
               batchRefreshSuccess: 'Successfully refreshed {{count}} accounts.',
               batchRefreshPartial: {
@@ -492,6 +495,9 @@ i18n
       vi: {
         translation: vi,
       },
+      tr: {
+        translation: tr,
+      },
       'zh-CN': {
         translation: {
           appName: 'Antigravity 管理器',
@@ -569,6 +575,7 @@ i18n
               chinese: '中文 (简体)',
               russian: '俄语',
               vietnamese: '越南语',
+              turkish: '土耳其语',
             },
             about: {
               title: '关于',
@@ -799,6 +806,7 @@ i18n
               proxySaved: '代理已保存',
               noProxy: '无代理',
               aiCredits: 'AI 积分',
+              aiCreditsValue: '{{amount}} 积分',
               creditsExpiry: '{{date}} 过期',
               modelVisibility: '模型可见性',
             },
@@ -862,7 +870,7 @@ i18n
               updateSettingsFailed: '更新设置失败',
               actionFailed: '操作失败',
               startAuthFailed: '启动登录流程失败',
-              refreshCreditsAvailable: 'AI 积分：${{amount}}',
+              refreshCreditsAvailable: 'AI 积分：{{amount}}',
               refreshCreditsUnavailable: '本次刷新没有可用的 AI 积分信息。',
               batchRefreshSuccess: '成功刷新 {{count}} 个账号。',
               batchRefreshPartial: {
@@ -1037,6 +1045,7 @@ i18n
               chinese: '中文 (简体)',
               russian: 'Русский',
               vietnamese: 'Вьетнамский',
+              turkish: 'Турецкий',
             },
             about: {
               title: 'О программе',
@@ -1272,6 +1281,7 @@ i18n
               proxySaved: 'Прокси сохранён',
               noProxy: 'Без прокси',
               aiCredits: 'AI Кредиты',
+              aiCreditsValue: '{{amount}} кредитов',
               creditsExpiry: 'истекает {{date}}',
               modelVisibility: 'Видимость моделей',
             },
@@ -1335,7 +1345,7 @@ i18n
               updateSettingsFailed: 'Не удалось обновить настройки',
               actionFailed: 'Не удалось выполнить действие',
               startAuthFailed: 'Не удалось запустить процесс входа',
-              refreshCreditsAvailable: 'AI кредиты: ${{amount}}',
+              refreshCreditsAvailable: 'AI кредиты: {{amount}}',
               refreshCreditsUnavailable: 'AI кредиты недоступны для этого обновления.',
               batchRefreshSuccess: 'Успешно обновлено {{count}} аккаунтов.',
               batchRefreshPartial: {

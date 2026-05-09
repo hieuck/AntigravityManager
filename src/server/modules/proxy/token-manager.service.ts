@@ -12,6 +12,7 @@ interface TokenData {
   account_id: string;
   access_token: string;
   refresh_token: string;
+  id_token?: string;
   oauth_client_key?: string;
   token_type: string;
   expires_in: number;
@@ -89,6 +90,8 @@ export class TokenManagerService implements OnModuleInit {
   private accountCooldowns: Map<string, number> = new Map();
   private sessionBindings: Map<string, { accountId: string; expiresAt: number }> = new Map();
   private rateLimitTracker = new RateLimitTracker();
+  private refreshLocks: Map<string, Promise<void>> = new Map();
+  private projectIdLocks: Map<string, Promise<string | undefined>> = new Map();
 
   private shadowComparisonCount = 0;
   private shadowMismatchCount = 0;
@@ -661,11 +664,7 @@ export class TokenManagerService implements OnModuleInit {
       }
 
       const limitCandidate = modelInfo.max_output_tokens ?? modelInfo.max_tokens;
-      if (
-        isNumber(limitCandidate) &&
-        Number.isFinite(limitCandidate) &&
-        limitCandidate > 0
-      ) {
+      if (isNumber(limitCandidate) && Number.isFinite(limitCandidate) && limitCandidate > 0) {
         modelLimits[normalizedModel] = Math.floor(limitCandidate);
       }
 
@@ -765,6 +764,7 @@ export class TokenManagerService implements OnModuleInit {
       email: account.email,
       access_token: account.token.access_token,
       refresh_token: account.token.refresh_token,
+      id_token: account.token.id_token,
       oauth_client_key: normalizeClientKey(account.token.oauth_client_key),
       token_type: account.token.token_type || 'Bearer',
       expires_in: account.token.expires_in,
@@ -797,28 +797,7 @@ export class TokenManagerService implements OnModuleInit {
     try {
       let effectiveProjectId: string | undefined;
 
-      if (nowSeconds >= tokenData.expiry_timestamp - 300) {
-        this.logger.log(`Access token near expiry for ${tokenData.email}; refreshing`);
-        try {
-          const newTokens = await GoogleAPIService.refreshAccessToken(
-            tokenData.refresh_token,
-            tokenData.upstream_proxy_url,
-            tokenData.oauth_client_key,
-          );
-          tokenData.access_token = newTokens.access_token;
-          tokenData.expires_in = newTokens.expires_in;
-          tokenData.expiry_timestamp = nowSeconds + newTokens.expires_in;
-          tokenData.oauth_client_key = this.normalizeRefreshedOauthClientKey(
-            tokenData,
-            newTokens.oauth_client_key,
-          );
-          await this.persistTokenState(accountId, tokenData);
-          this.tokens.set(accountId, tokenData);
-          this.logger.log(`Access token refreshed for ${tokenData.email}`);
-        } catch (e) {
-          this.logger.error(`Failed to refresh access token for ${tokenData.email}`, e);
-        }
-      }
+      await this.refreshSelectedTokenIfNeeded(accountId, tokenData, nowSeconds);
 
       if (normalizeProjectId(tokenData.project_id) === undefined) {
         tokenData.project_id = undefined;
@@ -826,23 +805,7 @@ export class TokenManagerService implements OnModuleInit {
       effectiveProjectId = tokenData.project_id;
 
       if (!effectiveProjectId) {
-        try {
-          const fetchedProjectId = await GoogleAPIService.fetchProjectId(tokenData.access_token);
-          const normalizedProjectId = normalizeProjectId(fetchedProjectId);
-          if (normalizedProjectId) {
-            tokenData.project_id = normalizedProjectId;
-            effectiveProjectId = normalizedProjectId;
-            await this.persistTokenState(accountId, tokenData);
-            this.tokens.set(accountId, tokenData);
-            this.logger.log(`Resolved project ID for ${tokenData.email}: ${normalizedProjectId}`);
-          } else {
-            this.logger.warn(
-              `Project ID unavailable for ${tokenData.email}; continuing without project context`,
-            );
-          }
-        } catch (error) {
-          this.logger.warn(`Unable to resolve project ID for ${tokenData.email}`, error);
-        }
+        effectiveProjectId = await this.resolveProjectIdWithLock(accountId, tokenData);
       }
 
       if (!effectiveProjectId) {
@@ -870,6 +833,7 @@ export class TokenManagerService implements OnModuleInit {
         token: {
           access_token: tokenData.access_token,
           refresh_token: tokenData.refresh_token,
+          id_token: tokenData.id_token,
           token_type: tokenData.token_type,
           expires_in: tokenData.expires_in,
           expiry_timestamp: tokenData.expiry_timestamp,
@@ -885,6 +849,140 @@ export class TokenManagerService implements OnModuleInit {
       this.logger.error('Failed to finalize selected account token', error);
       return null;
     }
+  }
+
+  private async refreshSelectedTokenIfNeeded(
+    accountId: string,
+    tokenData: TokenData,
+    nowSeconds: number,
+  ): Promise<void> {
+    if (nowSeconds < tokenData.expiry_timestamp - 300) {
+      return;
+    }
+
+    await this.runAccountLock(this.refreshLocks, accountId, () =>
+      this.refreshSelectedTokenLocked(accountId, tokenData, nowSeconds),
+    );
+    this.syncTokenDataFromCache(accountId, tokenData);
+  }
+
+  private async refreshSelectedTokenLocked(
+    accountId: string,
+    tokenData: TokenData,
+    nowSeconds: number,
+  ): Promise<void> {
+    const latestToken = this.tokens.get(accountId);
+    if (latestToken && nowSeconds < latestToken.expiry_timestamp - 300) {
+      Object.assign(tokenData, latestToken);
+      this.logger.debug(`Access token already refreshed by another request for ${tokenData.email}`);
+      return;
+    }
+
+    const tokenToRefresh = latestToken ?? tokenData;
+    this.logger.log(`Access token near expiry for ${tokenToRefresh.email}; refreshing`);
+    try {
+      const refreshedToken = await GoogleAPIService.refreshAccessToken(
+        tokenToRefresh.refresh_token,
+        tokenToRefresh.upstream_proxy_url,
+        tokenToRefresh.oauth_client_key,
+      );
+      tokenToRefresh.access_token = refreshedToken.access_token;
+      tokenToRefresh.refresh_token = refreshedToken.refresh_token ?? tokenToRefresh.refresh_token;
+      tokenToRefresh.id_token = refreshedToken.id_token ?? tokenToRefresh.id_token;
+      tokenToRefresh.expires_in = refreshedToken.expires_in;
+      tokenToRefresh.expiry_timestamp = nowSeconds + refreshedToken.expires_in;
+      tokenToRefresh.oauth_client_key = this.normalizeRefreshedOauthClientKey(
+        tokenToRefresh,
+        refreshedToken.oauth_client_key,
+      );
+      Object.assign(tokenData, tokenToRefresh);
+      await this.persistTokenState(accountId, tokenToRefresh);
+      this.tokens.set(accountId, tokenToRefresh);
+      this.logger.log(`Access token refreshed for ${tokenToRefresh.email}`);
+    } catch (error) {
+      this.logger.error(`Failed to refresh access token for ${tokenToRefresh.email}`, error);
+    }
+  }
+
+  private async resolveProjectIdWithLock(
+    accountId: string,
+    tokenData: TokenData,
+  ): Promise<string | undefined> {
+    const existingProjectId = normalizeProjectId(this.tokens.get(accountId)?.project_id);
+    if (existingProjectId) {
+      tokenData.project_id = existingProjectId;
+      return existingProjectId;
+    }
+
+    const projectId = await this.runAccountLock(this.projectIdLocks, accountId, () =>
+      this.resolveProjectIdLocked(accountId, tokenData),
+    );
+    if (projectId) {
+      tokenData.project_id = projectId;
+    }
+
+    return projectId;
+  }
+
+  private async runAccountLock<T>(
+    locks: Map<string, Promise<T>>,
+    accountId: string,
+    createPromise: () => Promise<T>,
+  ): Promise<T> {
+    const existingPromise = locks.get(accountId);
+    if (existingPromise) {
+      return existingPromise;
+    }
+
+    const promise = createPromise();
+    locks.set(accountId, promise);
+    try {
+      return await promise;
+    } finally {
+      if (locks.get(accountId) === promise) {
+        locks.delete(accountId);
+      }
+    }
+  }
+
+  private syncTokenDataFromCache(accountId: string, tokenData: TokenData): void {
+    const latestToken = this.tokens.get(accountId);
+    if (latestToken) {
+      Object.assign(tokenData, latestToken);
+    }
+  }
+
+  private async resolveProjectIdLocked(
+    accountId: string,
+    tokenData: TokenData,
+  ): Promise<string | undefined> {
+    const latestToken = this.tokens.get(accountId) ?? tokenData;
+    const existingProjectId = normalizeProjectId(latestToken.project_id);
+    if (existingProjectId) {
+      tokenData.project_id = existingProjectId;
+      return existingProjectId;
+    }
+
+    try {
+      const fetchedProjectId = await GoogleAPIService.fetchProjectId(latestToken.access_token);
+      const normalizedProjectId = normalizeProjectId(fetchedProjectId);
+      if (normalizedProjectId) {
+        latestToken.project_id = normalizedProjectId;
+        tokenData.project_id = normalizedProjectId;
+        await this.persistTokenState(accountId, latestToken);
+        this.tokens.set(accountId, latestToken);
+        this.logger.log(`Resolved project ID for ${latestToken.email}: ${normalizedProjectId}`);
+        return normalizedProjectId;
+      }
+
+      this.logger.warn(
+        `Project ID unavailable for ${latestToken.email}; continuing without project context`,
+      );
+    } catch (error) {
+      this.logger.warn(`Unable to resolve project ID for ${latestToken.email}`, error);
+    }
+
+    return undefined;
   }
 
   private resolveAccountId(accountIdOrEmail: string): string | null {
@@ -925,25 +1023,28 @@ export class TokenManagerService implements OnModuleInit {
 
   private async persistTokenState(accountId: string, tokenData: TokenData) {
     try {
-      const acc = await CloudAccountRepo.getAccount(accountId);
-      if (acc && acc.token) {
-        const newToken = {
-          ...acc.token,
+      const persistedAccount = await CloudAccountRepo.getAccount(accountId);
+      if (persistedAccount?.token) {
+        const updatedToken = {
+          ...persistedAccount.token,
           access_token: tokenData.access_token,
+          refresh_token: tokenData.refresh_token,
+          id_token: tokenData.id_token ?? persistedAccount.token.id_token,
           expires_in: tokenData.expires_in,
           expiry_timestamp: tokenData.expiry_timestamp,
-          project_id: tokenData.project_id ?? acc.token.project_id,
+          project_id: tokenData.project_id ?? persistedAccount.token.project_id,
           oauth_client_key:
             tokenData.oauth_client_key ??
-            normalizeClientKey(acc.token.oauth_client_key) ??
-            acc.token.oauth_client_key,
-          session_id: tokenData.session_id ?? acc.token.session_id,
-          upstream_proxy_url: tokenData.upstream_proxy_url ?? acc.token.upstream_proxy_url,
+            normalizeClientKey(persistedAccount.token.oauth_client_key) ??
+            persistedAccount.token.oauth_client_key,
+          session_id: tokenData.session_id ?? persistedAccount.token.session_id,
+          upstream_proxy_url:
+            tokenData.upstream_proxy_url ?? persistedAccount.token.upstream_proxy_url,
         };
-        await CloudAccountRepo.updateToken(accountId, newToken);
+        await CloudAccountRepo.updateToken(accountId, updatedToken);
       }
-    } catch (e) {
-      this.logger.error('Failed to persist token state to database', e);
+    } catch (error) {
+      this.logger.error('Failed to persist token state to database', error);
     }
   }
 

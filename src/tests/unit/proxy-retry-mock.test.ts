@@ -1,7 +1,10 @@
 import { beforeEach, describe, it, expect, vi } from 'vitest';
+import axios, { AxiosError } from 'axios';
 import { EventEmitter } from 'events';
+import { Readable } from 'node:stream';
 import { ProxyService } from '../../server/modules/proxy/proxy.service';
 import { Observable } from 'rxjs';
+import { GeminiClient } from '../../server/modules/proxy/clients/gemini.client';
 
 // Mock dependencies
 const mockTokenManager = {
@@ -510,6 +513,75 @@ describe('ProxyService Empty Stream Retry Logic', () => {
 
     const internalPayload = mockGeminiClient.streamGenerateInternal.mock.calls[0][0];
     expect(internalPayload.requestType).toBe('generate-content');
+  });
+});
+
+describe('GeminiClient internal request parity', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('uses fixed-length JSON body for non-stream internal requests', async () => {
+    const postSpy = vi.spyOn(axios, 'post').mockResolvedValue({
+      data: {
+        candidates: [{ content: { parts: [{ text: 'ok' }] } }],
+      },
+    });
+    const client = new GeminiClient();
+
+    await client.generateInternal({ project: 'project-1', request: {} } as any, 'access-token');
+
+    expect(postSpy).toHaveBeenCalledOnce();
+    expect(postSpy.mock.calls[0][1]).toBe(JSON.stringify({ project: 'project-1', request: {} }));
+    expect(postSpy.mock.calls[0][1]).not.toBeInstanceOf(Readable);
+  });
+
+  it('uses stream body only for streamGenerateContent internal requests', async () => {
+    const responseStream = new EventEmitter();
+    const postSpy = vi.spyOn(axios, 'post').mockResolvedValue({
+      data: responseStream,
+    });
+    const client = new GeminiClient();
+
+    await client.streamGenerateInternal(
+      { project: 'project-1', request: {} } as any,
+      'access-token',
+    );
+
+    expect(postSpy).toHaveBeenCalledOnce();
+    expect(postSpy.mock.calls[0][1]).toBeInstanceOf(Readable);
+  });
+
+  it('retries from the first endpoint without x-goog-user-project after project-header 403', async () => {
+    const forbidden = new AxiosError(
+      'Request failed with status code 403',
+      undefined,
+      undefined,
+      undefined,
+      {
+        data: { error: { message: 'SERVICE_DISABLED' } },
+        status: 403,
+        statusText: 'Forbidden',
+        headers: {},
+        config: {} as any,
+      },
+    );
+    const postSpy = vi
+      .spyOn(axios, 'post')
+      .mockRejectedValueOnce(forbidden)
+      .mockResolvedValueOnce({
+        data: {
+          candidates: [{ content: { parts: [{ text: 'ok' }] } }],
+        },
+      });
+    const client = new GeminiClient();
+
+    await client.generateInternal({ project: 'project-1', request: {} } as any, 'access-token');
+
+    expect(postSpy).toHaveBeenCalledTimes(2);
+    expect(postSpy.mock.calls[1][0]).toBe(postSpy.mock.calls[0][0]);
+    expect(postSpy.mock.calls[0][2]?.headers?.['x-goog-user-project']).toBe('project-1');
+    expect(postSpy.mock.calls[1][2]?.headers).not.toHaveProperty('x-goog-user-project');
   });
 });
 

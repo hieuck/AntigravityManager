@@ -1,6 +1,10 @@
 import { v4 as uuidv4 } from 'uuid';
 import { CloudAccountRepo } from '../../ipc/database/cloudHandler';
-import { GoogleAPIService, type OAuthClientDescriptor } from '../../services/GoogleAPIService';
+import {
+  GoogleAPIService,
+  type OAuthClientDescriptor,
+  type TokenResponse,
+} from '../../services/GoogleAPIService';
 import { CloudAccount, CloudAccountExportSchema } from '../../types/cloudAccount';
 import { logger } from '../../utils/logger';
 
@@ -30,14 +34,34 @@ function notifyTrayUpdate(account: CloudAccount) {
 
     const lang = CloudAccountRepo.getSetting<string>('language', 'en');
     updateTrayMenu(account, lang);
-  } catch (e) {
-    logger.warn('Failed to update tray', e);
+  } catch (error) {
+    logger.warn('Failed to update tray after cloud account update', error);
   }
 }
 
 const ACTIVE_OAUTH_CLIENT_KEY_SETTING = 'active_oauth_client_key';
 const OAUTH_CLIENT_KEY_BACKFILL_DONE_SETTING = 'oauth_client_key_backfill_v1_done';
 const ENTERPRISE_OAUTH_CLIENT_KEY = 'antigravity_enterprise';
+
+function mergeRefreshedToken(
+  currentToken: CloudAccount['token'],
+  refreshedToken: TokenResponse,
+  now: number,
+): CloudAccount['token'] {
+  return {
+    ...currentToken,
+    access_token: refreshedToken.access_token,
+    refresh_token: refreshedToken.refresh_token ?? currentToken.refresh_token,
+    expires_in: refreshedToken.expires_in,
+    expiry_timestamp: now + refreshedToken.expires_in,
+    token_type: refreshedToken.token_type,
+    id_token: refreshedToken.id_token ?? currentToken.id_token,
+    oauth_client_key: GoogleAPIService.normalizeRefreshedOAuthClientKey(
+      currentToken,
+      refreshedToken.oauth_client_key,
+    ),
+  };
+}
 
 function isEnterpriseClient(clientKey?: string): boolean {
   if (!clientKey) {
@@ -54,7 +78,10 @@ function normalizeProjectId(projectId?: string): string | null {
   return normalized === '' ? null : normalized;
 }
 
-function recoverCachedQuotaOnRateLimit(account: CloudAccount, error: unknown): CloudAccount['quota'] | null {
+function recoverCachedQuotaOnRateLimit(
+  account: CloudAccount,
+  error: unknown,
+): CloudAccount['quota'] | null {
   const classified = classifyAccountStatusFromError(error);
   if (!classified || classified.status !== 'rate_limited') {
     return null;
@@ -148,7 +175,10 @@ async function clearAccountStatus(account: CloudAccount): Promise<void> {
 }
 
 function hydrateActiveOAuthClientFromSettings(): void {
-  const preferredClientKey = CloudAccountRepo.getSetting<string>(ACTIVE_OAUTH_CLIENT_KEY_SETTING, '');
+  const preferredClientKey = CloudAccountRepo.getSetting<string>(
+    ACTIVE_OAUTH_CLIENT_KEY_SETTING,
+    '',
+  );
   if (isString(preferredClientKey) && !isEmpty(preferredClientKey.trim())) {
     try {
       GoogleAPIService.setActiveOAuthClientKey(preferredClientKey);
@@ -165,7 +195,10 @@ function hydrateActiveOAuthClientFromSettings(): void {
 async function backfillMissingOAuthClientKeyForLegacyAccounts(
   accounts: CloudAccount[],
 ): Promise<boolean> {
-  const backfillDone = CloudAccountRepo.getSetting<boolean>(OAUTH_CLIENT_KEY_BACKFILL_DONE_SETTING, false);
+  const backfillDone = CloudAccountRepo.getSetting<boolean>(
+    OAUTH_CLIENT_KEY_BACKFILL_DONE_SETTING,
+    false,
+  );
   if (backfillDone) {
     return false;
   }
@@ -267,7 +300,8 @@ export async function addGoogleAccount(
         token_type: tokenResp.token_type,
         email: userInfo.email,
         oauth_client_key: tokenResp.oauth_client_key,
-        is_gcp_tos: true,
+        is_gcp_tos: false,
+        id_token: tokenResp.id_token,
       },
       created_at: now,
       last_used: now,
@@ -282,20 +316,23 @@ export async function addGoogleAccount(
     try {
       const quota = await GoogleAPIService.fetchQuota(account.token.access_token);
       try {
-        const aiCredits = await GoogleAPIService.fetchAICredits(account.token.access_token);
+        const aiCredits = await GoogleAPIService.fetchAICredits(
+          account.token.access_token,
+          undefined,
+        );
         if (aiCredits) {
           quota.ai_credits = aiCredits;
         } else {
           logger.info(`No AI credits returned for ${account.email} during initial sync`);
         }
-      } catch (e) {
-        logger.warn('Failed to fetch initial AI credits', e);
+      } catch (error) {
+        logger.warn('Failed to fetch initial AI credits', error);
       }
       account.quota = quota;
       await CloudAccountRepo.updateQuota(account.id, account.quota);
       notifyTrayUpdate(account);
-    } catch (e) {
-      logger.warn('Failed to fetch initial quota', e);
+    } catch (error) {
+      logger.warn('Failed to fetch initial quota', error);
     }
 
     return account;
@@ -328,24 +365,17 @@ export async function refreshAccountQuota(accountId: string): Promise<CloudAccou
   if (account.token.expiry_timestamp < now + 300) {
     logger.info(`Token for ${account.email} near expiry, refreshing...`);
     try {
-      const newTokenData = await GoogleAPIService.refreshAccessToken(
+      const refreshedToken = await GoogleAPIService.refreshAccessToken(
         account.token.refresh_token,
         account.proxy_url,
         account.token.oauth_client_key,
       );
 
-      account.token.access_token = newTokenData.access_token;
-      account.token.expires_in = newTokenData.expires_in;
-      account.token.expiry_timestamp = now + newTokenData.expires_in;
-      account.token.oauth_client_key = GoogleAPIService.normalizeRefreshedOAuthClientKey(
-        account.token,
-        newTokenData.oauth_client_key,
-      );
-
+      account.token = mergeRefreshedToken(account.token, refreshedToken, now);
       await CloudAccountRepo.updateToken(account.id, account.token);
-    } catch (e) {
-      logger.error(`Failed to refresh token during time-check for ${account.email}`, e);
-      await markAccountStatusFromError(account, e);
+    } catch (error) {
+      logger.error(`Failed to refresh token during quota refresh precheck for ${account.email}`, error);
+      await markAccountStatusFromError(account, error);
       throw new Error(`Token refresh failed for ${account.email}. Please try logging in again.`);
     }
   }
@@ -367,8 +397,8 @@ export async function refreshAccountQuota(accountId: string): Promise<CloudAccou
           quota.ai_credits = previousAICredits;
         }
       }
-    } catch (e) {
-      logger.warn('Failed to fetch AI credits', e);
+    } catch (error) {
+      logger.warn('Failed to fetch AI credits during quota refresh', error);
       if (previousAICredits) {
         quota.ai_credits = previousAICredits;
       }
@@ -383,23 +413,16 @@ export async function refreshAccountQuota(accountId: string): Promise<CloudAccou
     return account;
   } catch (error: any) {
     if (error.message === 'UNAUTHORIZED') {
-      logger.warn(`Got 401 Unauthorized for ${account.email}, forcing token refresh...`);
+      logger.warn(`Received 401 Unauthorized for ${account.email}; forcing token refresh`);
       try {
-        const newTokenData = await GoogleAPIService.refreshAccessToken(
+        const refreshedToken = await GoogleAPIService.refreshAccessToken(
           account.token.refresh_token,
           account.proxy_url,
           account.token.oauth_client_key,
         );
         now = Math.floor(Date.now() / 1000);
 
-        account.token.access_token = newTokenData.access_token;
-        account.token.expires_in = newTokenData.expires_in;
-        account.token.expiry_timestamp = now + newTokenData.expires_in;
-        account.token.oauth_client_key = GoogleAPIService.normalizeRefreshedOAuthClientKey(
-          account.token,
-          newTokenData.oauth_client_key,
-        );
-
+        account.token = mergeRefreshedToken(account.token, refreshedToken, now);
         await CloudAccountRepo.updateToken(account.id, account.token);
 
         const previousAICredits = account.quota?.ai_credits;
@@ -421,8 +444,8 @@ export async function refreshAccountQuota(accountId: string): Promise<CloudAccou
               quota.ai_credits = previousAICredits;
             }
           }
-        } catch (e) {
-          logger.warn('Failed to fetch AI credits after token refresh', e);
+        } catch (error) {
+          logger.warn('Failed to fetch AI credits after token refresh', error);
           if (previousAICredits) {
             quota.ai_credits = previousAICredits;
           }
@@ -451,9 +474,7 @@ export async function refreshAccountQuota(accountId: string): Promise<CloudAccou
         throw refreshError;
       }
     } else if (error.message === 'FORBIDDEN') {
-      logger.warn(
-        `Got 403 Forbidden for ${account.email}, marking as rate limited (if implemented) or just ignoring.`,
-      );
+      logger.warn(`Received 403 Forbidden for ${account.email}; marking account status from error`);
       await markAccountStatusFromError(account, error);
       return account;
     }
@@ -491,38 +512,33 @@ export async function switchCloudAccount(accountId: string): Promise<void> {
         account.device_profile = generated;
       }
 
-      // 1. Prepare token refresh promise (start it in parallel with process exit)
       const tokenRefreshPromise = (async () => {
         const now = Math.floor(Date.now() / 1000);
-        if (account.token.expiry_timestamp < now + 1200) {
-          logger.info(`Token for ${account.email} near expiry, refreshing in parallel...`);
-          try {
-            const newTokenData = await GoogleAPIService.refreshAccessToken(
-              account.token.refresh_token,
-              account.proxy_url,
-              account.token.oauth_client_key,
-            );
+        if (!isString(account.token.refresh_token) || isEmpty(account.token.refresh_token.trim())) {
+          logger.warn(
+            `Token for ${account.email} has no refresh token; switched IDE session may expire without recovery.`,
+          );
+          return;
+        }
 
-            const updatedToken = {
-              ...account.token,
-              access_token: newTokenData.access_token,
-              expires_in: newTokenData.expires_in,
-              expiry_timestamp: now + newTokenData.expires_in,
-              oauth_client_key: GoogleAPIService.normalizeRefreshedOAuthClientKey(
-                account.token,
-                newTokenData.oauth_client_key,
-              ),
-            };
-            await CloudAccountRepo.updateToken(account.id, updatedToken);
+        logger.info(`Refreshing token for ${account.email} before IDE injection...`);
+        try {
+          const refreshedToken = await GoogleAPIService.refreshAccessToken(
+            account.token.refresh_token,
+            account.proxy_url,
+            account.token.oauth_client_key,
+          );
 
-            account.token = updatedToken;
-            logger.info(`Token refreshed for ${account.email}`);
-          } catch (e) {
-            logger.warn('Failed to refresh token in parallel', e);
-            await markAccountStatusFromError(account, e);
-            const reason = extractErrorMessage(e);
-            throw new Error(formatSwitchRefreshError(reason));
-          }
+          const updatedToken = mergeRefreshedToken(account.token, refreshedToken, now);
+          await CloudAccountRepo.updateToken(account.id, updatedToken);
+
+          account.token = updatedToken;
+          logger.info(`Token refreshed for ${account.email}`);
+        } catch (error) {
+          logger.warn('Failed to refresh token before IDE injection', error);
+          await markAccountStatusFromError(account, error);
+          const reason = extractErrorMessage(error);
+          throw new Error(formatSwitchRefreshError(reason));
         }
       })();
 
@@ -543,10 +559,10 @@ export async function switchCloudAccount(accountId: string): Promise<void> {
               await fs.promises.copyFile(dbPath, backupPath);
               logger.info(`Backed up database to ${backupPath}`);
               break; // Success, stop trying other paths
-            } catch (e: any) {
+            } catch (error: any) {
               // If file not found, just try the next path
-              if (e.code === 'ENOENT') continue;
-              logger.error(`Failed to backup database at ${dbPath}`, e);
+              if (error.code === 'ENOENT') continue;
+              logger.error(`Failed to backup database at ${dbPath}`, error);
             }
           }
 
@@ -708,7 +724,10 @@ export function getActiveOAuthClient(): string {
 
 export function setActiveOAuthClient(clientKey: string): void {
   GoogleAPIService.setActiveOAuthClientKey(clientKey);
-  CloudAccountRepo.setSetting(ACTIVE_OAUTH_CLIENT_KEY_SETTING, GoogleAPIService.getActiveOAuthClientKey());
+  CloudAccountRepo.setSetting(
+    ACTIVE_OAUTH_CLIENT_KEY_SETTING,
+    GoogleAPIService.getActiveOAuthClientKey(),
+  );
 }
 
 export async function exportCloudAccounts(stripTokens = false): Promise<string> {
@@ -716,18 +735,18 @@ export async function exportCloudAccounts(stripTokens = false): Promise<string> 
   const exportData = {
     version: '1.0' as const,
     exportedAt: Math.floor(Date.now() / 1000),
-    accounts: accounts.map((acc) => ({
-      provider: acc.provider,
-      email: acc.email,
-      name: acc.name,
-      avatar_url: acc.avatar_url,
-      token: stripTokens ? undefined : acc.token,
-      quota: acc.quota,
-      device_profile: acc.device_profile,
-      device_history: acc.device_history,
-      proxy_url: acc.proxy_url ?? null,
-      status: acc.status,
-      status_reason: acc.status_reason,
+    accounts: accounts.map((account) => ({
+      provider: account.provider,
+      email: account.email,
+      name: account.name,
+      avatar_url: account.avatar_url,
+      token: stripTokens ? undefined : account.token,
+      quota: account.quota,
+      device_profile: account.device_profile,
+      device_history: account.device_history,
+      proxy_url: account.proxy_url ?? null,
+      status: account.status,
+      status_reason: account.status_reason,
     })),
   };
 
@@ -758,10 +777,10 @@ export async function importCloudAccounts(
   }
 
   const importEmails = new Set<string>();
-  for (const acc of validated.data.accounts) {
-    const emailLower = acc.email.toLowerCase();
+  for (const importedAccount of validated.data.accounts) {
+    const emailLower = importedAccount.email.toLowerCase();
     if (importEmails.has(emailLower)) {
-      throw new Error(`Duplicate email found in import file: ${acc.email}`);
+      throw new Error(`Duplicate email found in import file: ${importedAccount.email}`);
     }
     importEmails.add(emailLower);
   }
@@ -769,9 +788,9 @@ export async function importCloudAccounts(
   const existingAccounts = await CloudAccountRepo.getAccounts();
   const existingByEmail = new Map(existingAccounts.map((a) => [a.email.toLowerCase(), a]));
 
-  for (const acc of validated.data.accounts) {
+  for (const importedAccount of validated.data.accounts) {
     try {
-      const existing = existingByEmail.get(acc.email.toLowerCase());
+      const existing = existingByEmail.get(importedAccount.email.toLowerCase());
       const now = Math.floor(Date.now() / 1000);
 
       if (existing) {
@@ -782,16 +801,16 @@ export async function importCloudAccounts(
 
         const updatedAccount: CloudAccount = {
           ...existing,
-          provider: acc.provider,
-          name: acc.name ?? existing.name,
-          avatar_url: acc.avatar_url ?? existing.avatar_url,
-          token: acc.token,
-          quota: acc.quota ?? existing.quota,
-          device_profile: acc.device_profile ?? existing.device_profile,
-          device_history: acc.device_history ?? existing.device_history,
-          proxy_url: acc.proxy_url ?? existing.proxy_url,
-          status: acc.status ?? existing.status,
-          status_reason: acc.status_reason ?? existing.status_reason,
+          provider: importedAccount.provider,
+          name: importedAccount.name ?? existing.name,
+          avatar_url: importedAccount.avatar_url ?? existing.avatar_url,
+          token: importedAccount.token,
+          quota: importedAccount.quota ?? existing.quota,
+          device_profile: importedAccount.device_profile ?? existing.device_profile,
+          device_history: importedAccount.device_history ?? existing.device_history,
+          proxy_url: importedAccount.proxy_url ?? existing.proxy_url,
+          status: importedAccount.status ?? existing.status,
+          status_reason: importedAccount.status_reason ?? existing.status_reason,
           last_used: now,
         };
 
@@ -800,19 +819,19 @@ export async function importCloudAccounts(
       } else {
         const newAccount: CloudAccount = {
           id: uuidv4(),
-          provider: acc.provider,
-          email: acc.email,
-          name: acc.name,
-          avatar_url: acc.avatar_url,
-          token: acc.token,
-          quota: acc.quota,
-          device_profile: acc.device_profile,
-          device_history: acc.device_history,
-          proxy_url: acc.proxy_url ?? undefined,
+          provider: importedAccount.provider,
+          email: importedAccount.email,
+          name: importedAccount.name,
+          avatar_url: importedAccount.avatar_url,
+          token: importedAccount.token,
+          quota: importedAccount.quota,
+          device_profile: importedAccount.device_profile,
+          device_history: importedAccount.device_history,
+          proxy_url: importedAccount.proxy_url ?? undefined,
           created_at: now,
           last_used: now,
-          status: acc.status ?? 'active',
-          status_reason: acc.status_reason,
+          status: importedAccount.status ?? 'active',
+          status_reason: importedAccount.status_reason,
           is_active: false,
         };
 

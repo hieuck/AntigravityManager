@@ -1,5 +1,5 @@
 import { Injectable, Logger, Inject } from '@nestjs/common';
-import { isEmpty, isNil, isNumber, isPlainObject, isString } from 'lodash-es';
+import { isEmpty, isFunction, isNil, isNumber, isPlainObject, isString } from 'lodash-es';
 import { TokenManagerService } from './token-manager.service';
 import { GeminiClient } from './clients/gemini.client';
 import { v4 as uuidv4 } from 'uuid';
@@ -33,15 +33,147 @@ import {
 import { getMaxOutputTokens, getThinkingBudget } from '../../../lib/antigravity/ModelSpecs';
 import { resolveRequestUserAgent } from './request-user-agent';
 import { UpstreamRequestError } from './clients/upstream-error';
+import {
+  GRACE_RETRY_BUFFER_MS,
+  parseRetryDelayMilliseconds,
+  shouldGraceRetry,
+} from './rate-limit-tracker';
+import { CloudAccount } from '../../../types/cloudAccount';
+
+interface TokenRetryState {
+  attemptedAccountIds: Set<string>;
+  graceRetryToken: CloudAccount | null;
+}
+
+interface StreamIdleTimer {
+  reset: () => void;
+  clear: () => void;
+  dispose: () => void;
+}
 
 @Injectable()
 export class ProxyService {
   private readonly logger = new Logger(ProxyService.name);
+  private readonly streamIdleTimeoutMs = 300_000;
 
   constructor(
     @Inject(TokenManagerService) private readonly tokenManager: TokenManagerService,
     @Inject(GeminiClient) private readonly geminiClient: GeminiClient,
   ) {}
+
+  private createOfficialRequestId(): string {
+    const timestampMs = Date.now();
+    const randomHex = uuidv4().replace(/-/g, '').slice(0, 8);
+    return `agent/${timestampMs}/${randomHex}`;
+  }
+
+  private destroyUpstreamStream(upstreamStream: NodeJS.ReadableStream): void {
+    const destroy = (upstreamStream as { destroy?: () => void }).destroy;
+    if (isFunction(destroy)) {
+      destroy.call(upstreamStream);
+    }
+  }
+
+  private createStreamIdleTimer(
+    upstreamStream: NodeJS.ReadableStream,
+    label: string,
+    onTimeout: () => void,
+  ): StreamIdleTimer {
+    let idleTimer: NodeJS.Timeout | undefined;
+
+    const clear = (): void => {
+      if (idleTimer) {
+        clearTimeout(idleTimer);
+        idleTimer = undefined;
+      }
+    };
+
+    const reset = (): void => {
+      clear();
+      idleTimer = setTimeout(() => {
+        this.logger.error(`[${label}] Idle timeout after 300s, terminating stream`);
+        onTimeout();
+        this.destroyUpstreamStream(upstreamStream);
+      }, this.streamIdleTimeoutMs);
+    };
+
+    return {
+      reset,
+      clear,
+      dispose: () => {
+        clear();
+        this.destroyUpstreamStream(upstreamStream);
+      },
+    };
+  }
+
+  private createTokenRetryState(): TokenRetryState {
+    return {
+      attemptedAccountIds: new Set<string>(),
+      graceRetryToken: null,
+    };
+  }
+
+  private async selectRetryToken(
+    retryState: TokenRetryState,
+    model: string,
+    sessionKey?: string,
+  ): Promise<CloudAccount | null> {
+    const graceRetryToken = retryState.graceRetryToken;
+    retryState.graceRetryToken = null;
+
+    if (graceRetryToken) {
+      return graceRetryToken;
+    }
+
+    const token = await this.tokenManager.getNextToken({
+      sessionKey,
+      excludeAccountIds: Array.from(retryState.attemptedAccountIds),
+      model,
+    });
+    if (!token) {
+      return null;
+    }
+
+    retryState.attemptedAccountIds.add(token.id);
+    return token;
+  }
+
+  private async waitBeforeRetry(
+    attemptIndex: number,
+    maxRetries: number,
+    label: string,
+    shouldSkipBackoff: boolean,
+  ): Promise<void> {
+    if (attemptIndex === 0 || shouldSkipBackoff) {
+      return;
+    }
+
+    const delay = calculateRetryDelay(attemptIndex - 1);
+    this.logger.log(
+      `${label} retry ${attemptIndex + 1}/${maxRetries}, backoff=${delay}ms (jittered)`,
+    );
+    await sleep(delay);
+  }
+
+  private async prepareGraceRetry(
+    retryState: TokenRetryState,
+    token: CloudAccount,
+    error: unknown,
+    label: string,
+  ): Promise<boolean> {
+    const graceRetryDelay = this.resolveGraceRetryDelay(error);
+    if (graceRetryDelay === null) {
+      return false;
+    }
+
+    this.logger.log(
+      `${label} grace retry on same account ${token.id}, waiting ${graceRetryDelay}ms`,
+    );
+    await sleep(graceRetryDelay);
+    retryState.graceRetryToken = token;
+    return true;
+  }
 
   // --- Anthropic Handlers ---
 
@@ -59,24 +191,15 @@ export class ProxyService {
     // Retry loop
     let lastError: unknown = null;
     const maxRetries = 3;
-    const attemptedAccountIds = new Set<string>();
+    const retryState = this.createTokenRetryState();
 
     for (let i = 0; i < maxRetries; i++) {
-      if (i > 0) {
-        const delay = calculateRetryDelay(i - 1);
-        this.logger.log(`Anthropic retry ${i + 1}/${maxRetries}, backoff=${delay}ms (jittered)`);
-        await sleep(delay);
-      }
+      await this.waitBeforeRetry(i, maxRetries, 'Anthropic', retryState.graceRetryToken !== null);
 
-      const token = await this.tokenManager.getNextToken({
-        sessionKey,
-        excludeAccountIds: Array.from(attemptedAccountIds),
-        model: targetModel,
-      });
+      const token = await this.selectRetryToken(retryState, targetModel, sessionKey);
       if (!token) {
         throw new Error('No available accounts');
       }
-      attemptedAccountIds.add(token.id);
       const effectiveTargetModel = this.tokenManager.resolveDynamicModelForAccount(
         token.id,
         targetModel,
@@ -189,6 +312,9 @@ export class ProxyService {
         }
 
         lastError = error;
+        if (await this.prepareGraceRetry(retryState, token, lastError, 'Anthropic')) {
+          continue;
+        }
         await this.applyUpstreamPenalty(token.id, effectiveTargetModel, error);
       }
     }
@@ -210,9 +336,16 @@ export class ProxyService {
       let lastUsageMetadata: Record<string, unknown> | undefined;
 
       let receivedData = false;
+      const idleTimer = this.createStreamIdleTimer(upstreamStream, 'Claude-SSE', () => {
+        subscriber.next('data: {"type": "message_stop"}\n\ndata: [DONE]\n\n');
+        subscriber.complete();
+      });
+
+      idleTimer.reset();
 
       upstreamStream.on('data', (chunk: Buffer) => {
         receivedData = true; // Mark that we got data
+        idleTimer.reset();
         buffer += decoder.decode(chunk, { stream: true });
         const lines = buffer.split('\n');
         buffer = lines.pop() || '';
@@ -257,6 +390,7 @@ export class ProxyService {
       });
 
       upstreamStream.on('end', () => {
+        idleTimer.clear();
         if (!receivedData) {
           this.logger.warn('Empty response stream detected');
           subscriber.error(new Error('Empty response stream'));
@@ -269,12 +403,17 @@ export class ProxyService {
       });
 
       upstreamStream.on('error', (err: unknown) => {
+        idleTimer.clear();
         const cleanError = err instanceof Error ? err : new Error(String(err));
         const { type } = classifyStreamError(cleanError);
 
         this.logger.error(`Stream error: ${type} - ${cleanError.message}`);
         subscriber.error(cleanError);
       });
+
+      return () => {
+        idleTimer.dispose();
+      };
     });
   }
 
@@ -292,23 +431,15 @@ export class ProxyService {
 
     let lastError: unknown = null;
     const maxRetries = 3;
-    const attemptedAccountIds = new Set<string>();
+    const retryState = this.createTokenRetryState();
 
     for (let i = 0; i < maxRetries; i++) {
-      if (i > 0) {
-        const delay = calculateRetryDelay(i - 1);
-        this.logger.log(`Gemini retry attempt ${i + 1}/${maxRetries}, waiting ${delay}ms`);
-        await sleep(delay);
-      }
+      await this.waitBeforeRetry(i, maxRetries, 'Gemini', retryState.graceRetryToken !== null);
 
-      const token = await this.tokenManager.getNextToken({
-        excludeAccountIds: Array.from(attemptedAccountIds),
-        model: targetModel,
-      });
+      const token = await this.selectRetryToken(retryState, targetModel);
       if (!token) {
         throw new Error('No available accounts (all exhausted or rate limited)');
       }
-      attemptedAccountIds.add(token.id);
       const effectiveTargetModel = this.tokenManager.resolveDynamicModelForAccount(
         token.id,
         targetModel,
@@ -362,6 +493,9 @@ export class ProxyService {
           lastError = err;
         }
 
+        if (await this.prepareGraceRetry(retryState, token, lastError, 'Gemini')) {
+          continue;
+        }
         await this.applyUpstreamPenalty(token.id, effectiveTargetModel, lastError);
       }
     }
@@ -382,23 +516,20 @@ export class ProxyService {
 
     let lastError: unknown = null;
     const maxRetries = 3;
-    const attemptedAccountIds = new Set<string>();
+    const retryState = this.createTokenRetryState();
 
     for (let i = 0; i < maxRetries; i++) {
-      if (i > 0) {
-        const delay = calculateRetryDelay(i - 1);
-        this.logger.log(`Gemini stream retry attempt ${i + 1}/${maxRetries}, waiting ${delay}ms`);
-        await sleep(delay);
-      }
+      await this.waitBeforeRetry(
+        i,
+        maxRetries,
+        'Gemini stream',
+        retryState.graceRetryToken !== null,
+      );
 
-      const token = await this.tokenManager.getNextToken({
-        excludeAccountIds: Array.from(attemptedAccountIds),
-        model: targetModel,
-      });
+      const token = await this.selectRetryToken(retryState, targetModel);
       if (!token) {
         throw new Error('No available accounts (all exhausted or rate limited)');
       }
-      attemptedAccountIds.add(token.id);
       const effectiveTargetModel = this.tokenManager.resolveDynamicModelForAccount(
         token.id,
         targetModel,
@@ -451,6 +582,9 @@ export class ProxyService {
           lastError = err;
         }
 
+        if (await this.prepareGraceRetry(retryState, token, lastError, 'Gemini stream')) {
+          continue;
+        }
         await this.applyUpstreamPenalty(token.id, effectiveTargetModel, lastError);
       }
     }
@@ -462,13 +596,20 @@ export class ProxyService {
     return new Observable<string>((subscriber) => {
       const decoder = new TextDecoder();
       let receivedData = false;
+      const idleTimer = this.createStreamIdleTimer(upstreamStream, 'Gemini-SSE', () => {
+        subscriber.complete();
+      });
+
+      idleTimer.reset();
 
       upstreamStream.on('data', (chunk: Buffer) => {
         receivedData = true;
+        idleTimer.reset();
         subscriber.next(decoder.decode(chunk, { stream: true }));
       });
 
       upstreamStream.on('end', () => {
+        idleTimer.clear();
         if (!receivedData) {
           subscriber.error(new Error('Empty response stream'));
           return;
@@ -477,9 +618,14 @@ export class ProxyService {
       });
 
       upstreamStream.on('error', (err: unknown) => {
+        idleTimer.clear();
         const cleanError = err instanceof Error ? new Error(err.message) : new Error(String(err));
         subscriber.error(cleanError);
       });
+
+      return () => {
+        idleTimer.dispose();
+      };
     });
   }
 
@@ -615,7 +761,7 @@ export class ProxyService {
     const normalizedProjectId = projectId?.trim();
 
     const internalRequest: GeminiInternalRequest = {
-      requestId: uuidv4(),
+      requestId: this.createOfficialRequestId(),
       request: this.toInternalGeminiRequest(request),
       model,
       userAgent: requestUserAgent,
@@ -624,6 +770,10 @@ export class ProxyService {
 
     if (normalizedProjectId) {
       internalRequest.project = normalizedProjectId;
+    }
+
+    if (requestType !== 'image_gen') {
+      internalRequest.enabledCreditTypes = ['GOOGLE_ONE_AI'];
     }
 
     return internalRequest;
@@ -685,27 +835,21 @@ export class ProxyService {
     // Retry loop for account selection
     let lastError: unknown = null;
     const maxRetries = 3;
-    const attemptedAccountIds = new Set<string>();
+    const retryState = this.createTokenRetryState();
 
     for (let i = 0; i < maxRetries; i++) {
-      if (i > 0) {
-        const delay = calculateRetryDelay(i - 1);
-        this.logger.log(
-          `OpenAI-compatible retry ${i + 1}/${maxRetries}, backoff=${delay}ms (jittered)`,
-        );
-        await sleep(delay);
-      }
+      await this.waitBeforeRetry(
+        i,
+        maxRetries,
+        'OpenAI-compatible',
+        retryState.graceRetryToken !== null,
+      );
 
       // 1. Get Token
-      const token = await this.tokenManager.getNextToken({
-        sessionKey,
-        excludeAccountIds: Array.from(attemptedAccountIds),
-        model: targetModel,
-      });
+      const token = await this.selectRetryToken(retryState, targetModel, sessionKey);
       if (!token) {
         throw new Error('No available accounts (all exhausted or rate limited)');
       }
-      attemptedAccountIds.add(token.id);
       const effectiveTargetModel = this.tokenManager.resolveDynamicModelForAccount(
         token.id,
         targetModel,
@@ -805,6 +949,9 @@ export class ProxyService {
           lastError = err;
         }
 
+        if (await this.prepareGraceRetry(retryState, token, lastError, 'OpenAI-compatible')) {
+          continue;
+        }
         await this.applyUpstreamPenalty(token.id, effectiveTargetModel, lastError);
       }
     }
@@ -858,9 +1005,15 @@ export class ProxyService {
       const mergedParts: InternalGeminiPart[] = [];
       let finishReason: string | undefined;
       let usageMetadata: GeminiResponse['usageMetadata'];
+      const idleTimer = this.createStreamIdleTimer(upstreamStream, 'Gemini-Collect', () => {
+        reject(new Error('Stream idle timeout'));
+      });
+
+      idleTimer.reset();
 
       upstreamStream.on('data', (chunk: Buffer) => {
         receivedData = true;
+        idleTimer.reset();
         buffer += decoder.decode(chunk, { stream: true });
         const lines = buffer.split('\n');
         buffer = lines.pop() || '';
@@ -899,6 +1052,7 @@ export class ProxyService {
       });
 
       upstreamStream.on('end', () => {
+        idleTimer.clear();
         if (!receivedData) {
           reject(new Error('Empty response stream'));
           return;
@@ -919,6 +1073,7 @@ export class ProxyService {
       });
 
       upstreamStream.on('error', (error: unknown) => {
+        idleTimer.clear();
         reject(error instanceof Error ? error : new Error(String(error)));
       });
     });
@@ -943,7 +1098,18 @@ export class ProxyService {
         subscriber.next(`data: ${JSON.stringify(payload)}\n\n`);
       };
 
+      const idleTimer = this.createStreamIdleTimer(upstreamStream, 'OpenAI-SSE', () => {
+        if (!hasSentDone) {
+          subscriber.next('data: [DONE]\n\n');
+          hasSentDone = true;
+        }
+        subscriber.complete();
+      });
+
+      idleTimer.reset();
+
       upstreamStream.on('data', (chunk: Buffer) => {
+        idleTimer.reset();
         buffer += decoder.decode(chunk, { stream: true });
         const lines = buffer.split('\n');
         buffer = lines.pop() || '';
@@ -1076,6 +1242,7 @@ export class ProxyService {
       });
 
       upstreamStream.on('end', () => {
+        idleTimer.clear();
         if (!hasEmittedChunk) {
           pushChunk({
             id: streamId,
@@ -1099,11 +1266,16 @@ export class ProxyService {
       });
 
       upstreamStream.on('error', (err: unknown) => {
+        idleTimer.clear();
         // Convert to clean Error to avoid circular reference issues (socket objects)
         const cleanError = err instanceof Error ? new Error(err.message) : new Error(String(err));
         this.logger.error(`OpenAI-compatible stream error: ${cleanError.message}`);
         subscriber.error(cleanError);
       });
+
+      return () => {
+        idleTimer.dispose();
+      };
     });
   }
 
@@ -1618,6 +1790,20 @@ export class ProxyService {
     if (penaltyDecision.markAsRateLimited) {
       this.tokenManager.markAsRateLimited(accountId);
     }
+  }
+
+  private resolveGraceRetryDelay(error: unknown): number | null {
+    if (!(error instanceof UpstreamRequestError) || error.status !== 429) {
+      return null;
+    }
+
+    const errorText = [error.body, error.message].filter(isString).join('\n');
+    const retryDelayMs = parseRetryDelayMilliseconds(errorText);
+    if (retryDelayMs === null || !shouldGraceRetry(retryDelayMs)) {
+      return null;
+    }
+
+    return retryDelayMs + GRACE_RETRY_BUFFER_MS;
   }
 
   private classifyUpstreamFailure(errorMessage: string): {

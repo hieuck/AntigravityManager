@@ -2,6 +2,47 @@
 
 # Changelog
 
+## [0.12.0](https://github.com/Draculabo/AntigravityManager/compare/v0.11.1...v0.12.0) (2026-05-07)
+
+### ✨ Features
+
+* increase the request timeout period ([8a0637f](https://github.com/Draculabo/AntigravityManager/commit/8a0637f925073ee9354dbea1ae0d1dc433b2ecad))
+
+### 🐛 Bug Fixes
+
+* **cloud:** preserve Google token metadata during sync ([b9e932d](https://github.com/Draculabo/AntigravityManager/commit/b9e932df61bf28c235888e9c96ff20ad8135316a))
+* **proxy:** align upstream retry and rate-limit handling ([dbf5345](https://github.com/Draculabo/AntigravityManager/commit/dbf53454c55b5dfc810286e90953c826e07ddbce))
+* refresh Google token before account switch injection ([#168](https://github.com/Draculabo/AntigravityManager/issues/168)) ([03a1307](https://github.com/Draculabo/AntigravityManager/commit/03a13077d11191212efe2372b65196127a4d9d02))
+
+### ♻️ Code Refactoring
+
+* **antigravity:** clarify request and quota mapping ([0758b1d](https://github.com/Draculabo/AntigravityManager/commit/0758b1d1326413ec6cc1b9382fb4b66295631e1b))
+
+### ✅ Tests
+
+* remove obsolete core feature suite ([abcee97](https://github.com/Draculabo/AntigravityManager/commit/abcee97c372aa322fd0628822bf02551727253ef))
+
+### 🔧 Continuous Integration
+
+* align publish workflow with Node 22 and add npm install retry ([158d2f3](https://github.com/Draculabo/AntigravityManager/commit/158d2f30ccf05803f380966982cadd2b58f68a17))
+
+## [0.11.1](https://github.com/Draculabo/AntigravityManager/compare/v0.11.0...v0.11.1) (2026-04-18)
+
+### 🐛 Bug Fixes
+
+* add unit label to AI credit display ([6577f1c](https://github.com/Draculabo/AntigravityManager/commit/6577f1c51fd155004b81f6171eb5feffa2448128))
+* remaining localization gaps ([#156](https://github.com/Draculabo/AntigravityManager/issues/156)) ([7093c98](https://github.com/Draculabo/AntigravityManager/commit/7093c982ba790380cda7d1e8a53891970df6b3cf))
+* remove AI credit refresh time scraping ([3e1e10b](https://github.com/Draculabo/AntigravityManager/commit/3e1e10b2a580ebf5a64b9a8982bd812a6a1f2924))
+
+### 📝 Documentation
+
+* **repo:** update project docs ([440a934](https://github.com/Draculabo/AntigravityManager/commit/440a9342800f244287c758b1a77a05fac9096df7))
+
+### ♻️ Code Refactoring
+
+* **ipc:** migrate renderer IPC client to official oRPC client ([d0c282d](https://github.com/Draculabo/AntigravityManager/commit/d0c282dffff24bb74a81cfa523f2f72f949bf8f9))
+* standardize runtime guard patterns with lodash-es ([#154](https://github.com/Draculabo/AntigravityManager/issues/154)) ([bc35b96](https://github.com/Draculabo/AntigravityManager/commit/bc35b96b5d2d873cf0f187a57de695aedc32108f))
+
 ## [0.11.0](https://github.com/Draculabo/AntigravityManager/compare/v0.10.0...v0.11.0) (2026-04-11)
 
 ### ✨ Features

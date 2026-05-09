@@ -146,7 +146,13 @@ describe('CloudAccountRepo.syncFromIDE', () => {
   it('should prefer unified oauth token when present', async () => {
     const accessToken = 'access-new';
     const refreshToken = 'refresh-new';
-    const unifiedB64 = ProtobufUtils.createUnifiedOAuthToken(accessToken, refreshToken, 1700000000);
+    const unifiedB64 = ProtobufUtils.createUnifiedOAuthToken(
+      accessToken,
+      refreshToken,
+      1700000000,
+      true,
+      'id-new',
+    );
 
     const oldB64 = Buffer.from(
       ProtobufUtils.createOAuthTokenInfo('access-old', 'refresh-old', 1700000000),
@@ -167,6 +173,8 @@ describe('CloudAccountRepo.syncFromIDE', () => {
 
     expect(GoogleAPIService.getUserInfo).toHaveBeenCalledWith(accessToken);
     expect(account?.email).toBe('new@example.com');
+    expect(account?.token.id_token).toBe('id-new');
+    expect(account?.token.is_gcp_tos).toBe(false);
   });
 
   it('reads enterprise project preference from IDE unified state when syncing new account', async () => {
@@ -429,7 +437,7 @@ describe('CloudAccountRepo.syncFromIDE', () => {
     expect(account?.email).toBe('retry@example.com');
   });
 
-  it('should prefer new format when capability detection finds unified key', async () => {
+  it('should inject both formats when version detection fails', async () => {
     vi.resetModules();
     vi.doMock('../../utils/antigravityVersion', () => ({
       getAntigravityVersion: () => {
@@ -443,7 +451,9 @@ describe('CloudAccountRepo.syncFromIDE', () => {
     const refreshToken = 'refresh-new';
 
     mockData['antigravityUnifiedStateSync.oauthToken'] = 'exists';
-    mockData['jetskiStateSync.agentManagerInitState'] = 'exists-old';
+    mockData['jetskiStateSync.agentManagerInitState'] = Buffer.from(
+      ProtobufUtils.createOAuthTokenInfo('old-access', 'old-refresh', 1699999999),
+    ).toString('base64');
 
     RepoWithMock.injectCloudToken({
       id: 'id',
@@ -478,7 +488,7 @@ describe('CloudAccountRepo.syncFromIDE', () => {
     );
 
     expect(wroteUnifiedKey).toBe(true);
-    expect(updatedOldKey).toBe(false);
+    expect(updatedOldKey).toBe(true);
   });
 });
 
@@ -509,6 +519,13 @@ describe('cloud switch fail-fast path', () => {
     const startAntigravityMock = vi.fn(async () => undefined);
     const recordSwitchFailureMock = vi.fn();
     const recordSwitchSuccessMock = vi.fn();
+    const updateTokenMock = vi.fn(async () => undefined);
+    const refreshAccessTokenMock = vi.fn(async () => ({
+      access_token: 'refreshed-access',
+      expires_in: 3600,
+      token_type: 'Bearer',
+      oauth_client_key: 'custom_a',
+    }));
 
     const account = {
       id: 'acc-1',
@@ -537,7 +554,7 @@ describe('cloud switch fail-fast path', () => {
       CloudAccountRepo: {
         getAccount: vi.fn(async () => account),
         setDeviceBinding: vi.fn(),
-        updateToken: vi.fn(async () => undefined),
+        updateToken: updateTokenMock,
         injectCloudToken: vi.fn(() => {
           throw new Error('inject_failed');
         }),
@@ -590,7 +607,10 @@ describe('cloud switch fail-fast path', () => {
 
     vi.doMock('../../services/GoogleAPIService', () => ({
       GoogleAPIService: {
-        refreshAccessToken: vi.fn(async () => undefined),
+        refreshAccessToken: refreshAccessTokenMock,
+        normalizeRefreshedOAuthClientKey: vi.fn(
+          (_currentToken: unknown, refreshedClientKey?: string) => refreshedClientKey,
+        ),
       },
     }));
 
@@ -603,6 +623,14 @@ describe('cloud switch fail-fast path', () => {
     const { switchCloudAccount } = await import('../../ipc/cloud/handler');
     await expect(switchCloudAccount('acc-1')).rejects.toThrow('Switch failed: inject_failed');
 
+    expect(refreshAccessTokenMock).toHaveBeenCalledWith('refresh', undefined, undefined);
+    expect(updateTokenMock).toHaveBeenCalledWith(
+      'acc-1',
+      expect.objectContaining({
+        access_token: 'refreshed-access',
+        expiry_timestamp: expect.any(Number),
+      }),
+    );
     expect(applyDeviceProfileMock).toHaveBeenCalledTimes(1);
     expect(applyDeviceProfileMock).toHaveBeenCalledWith(account.device_profile);
     expect(startAntigravityMock).not.toHaveBeenCalled();

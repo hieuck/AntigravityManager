@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import axios, { AxiosProxyConfig, AxiosRequestConfig, AxiosResponse } from 'axios';
 import { isEmpty, isFunction, isNil, isObjectLike, isString } from 'lodash-es';
+import { Readable } from 'node:stream';
 import { GeminiRequest, GeminiResponse } from '../interfaces/request-interfaces';
 import { GeminiInternalRequest } from '../../../../lib/antigravity/types';
 import { getServerConfig } from '../../../server-config';
@@ -154,7 +155,7 @@ export class GeminiClient {
 
   private getInternalTimeoutMs(): number {
     const config = getServerConfig();
-    const timeoutSeconds = config?.request_timeout ?? 60;
+    const timeoutSeconds = config?.request_timeout ?? 300;
     return Math.max(1, timeoutSeconds) * 1000;
   }
 
@@ -191,41 +192,96 @@ export class GeminiClient {
     const requestUserAgent = await resolveRequestUserAgent();
     const axiosProxy = this.resolveUpstreamAxiosProxy(upstreamProxyUrl);
     let lastError: unknown = null;
+    let hasTriggeredProjectHeaderDowngrade = false;
 
-    for (let index = 0; index < baseUrls.length; index++) {
-      const baseUrl = baseUrls[index];
-      const url = `${baseUrl}${path}`;
+    for (let projectHeaderAttempt = 0; projectHeaderAttempt < 5; projectHeaderAttempt++) {
+      let shouldRetryWithoutProjectHeader = false;
+      const projectHeaders = hasTriggeredProjectHeaderDowngrade
+        ? {}
+        : this.createProjectHeaders(body);
 
-      try {
-        return await axios.post<T>(url, body, {
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            'Content-Type': 'application/json',
-            'User-Agent': requestUserAgent,
-            ...(extraHeaders ?? {}),
-          },
-          timeout,
-          proxy: axiosProxy,
-          ...config,
-        });
-      } catch (error) {
-        lastError = error;
-        const hasNextEndpoint = index < baseUrls.length - 1;
+      for (let index = 0; index < baseUrls.length; index++) {
+        const baseUrl = baseUrls[index];
+        const url = `${baseUrl}${path}`;
 
-        if (!hasNextEndpoint || !this.shouldFailoverToNextEndpoint(error)) {
-          await this.throwUpstreamRequestError(error, operation);
+        try {
+          return await axios.post<T>(url, this.createInternalRequestBody(path, body), {
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              'Content-Type': 'application/json',
+              'User-Agent': requestUserAgent,
+              ...projectHeaders,
+              ...(extraHeaders ?? {}),
+            },
+            timeout,
+            proxy: axiosProxy,
+            ...config,
+          });
+        } catch (error) {
+          lastError = error;
+
+          if (this.shouldRetryWithoutProjectHeader(error, projectHeaders)) {
+            this.logger.warn(
+              `[${operation}] received 403 with x-goog-user-project; retrying without project header.`,
+            );
+            hasTriggeredProjectHeaderDowngrade = true;
+            shouldRetryWithoutProjectHeader = true;
+            break;
+          }
+
+          const hasNextEndpoint = index < baseUrls.length - 1;
+
+          if (!hasNextEndpoint || !this.shouldFailoverToNextEndpoint(error)) {
+            await this.throwUpstreamRequestError(error, operation);
+          }
+
+          this.logger.warn(
+            `[${operation}] request failed at ${baseUrl}; trying next endpoint (${index + 2}/${
+              baseUrls.length
+            }).`,
+          );
         }
-
-        this.logger.warn(
-          `[${operation}] request failed at ${baseUrl}; trying next endpoint (${index + 2}/${
-            baseUrls.length
-          }).`,
-        );
       }
+
+      if (shouldRetryWithoutProjectHeader) {
+        continue;
+      }
+
+      return await this.throwUpstreamRequestError(lastError, operation);
     }
 
-    await this.throwUpstreamRequestError(lastError, operation);
-    throw new Error(`[${operation}] unexpected control flow after upstream error handling`);
+    return await this.throwUpstreamRequestError(lastError, operation);
+  }
+
+  private createInternalRequestBody(path: string, body: GeminiInternalRequest): string | Readable {
+    const bodyText = JSON.stringify(body);
+    if (path.startsWith(':streamGenerateContent')) {
+      return Readable.from([bodyText]);
+    }
+
+    return bodyText;
+  }
+
+  private createProjectHeaders(body: GeminiInternalRequest): Record<string, string> {
+    const project = body.project?.trim();
+    if (!project) {
+      return {};
+    }
+
+    return {
+      'x-goog-user-project': project,
+    };
+  }
+
+  private shouldRetryWithoutProjectHeader(
+    error: unknown,
+    projectHeaders: Record<string, string>,
+  ): boolean {
+    return (
+      axios.isAxiosError(error) &&
+      error.response?.status === 403 &&
+      Boolean(projectHeaders['x-goog-user-project'])
+    );
   }
 
   private async throwUpstreamRequestError(error: unknown, operation: string): Promise<never> {

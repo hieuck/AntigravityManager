@@ -38,28 +38,55 @@ interface ParsedGoogleErrorBody {
 }
 
 const FAILURE_COUNT_EXPIRY_MS = 60 * 60 * 1000;
+const MAX_RETRY_DELAY_SEARCH_DEPTH = 8;
+const GRACE_RETRY_WINDOW_MS = 2000;
+export const GRACE_RETRY_BUFFER_MS = 1500;
+const DURATION_UNIT_TO_MS = {
+  ms: 1,
+  s: 1000,
+  m: 60 * 1000,
+  h: 60 * 60 * 1000,
+} as const;
+const RETRY_HINT_KEYS = new Set(['retryafter', 'retrydelay', 'quotaresetdelay', 'backofflimit']);
+const QUOTA_RETRY_PATTERNS = [
+  /quota will reset after ([^.,;\]\n]+)/i,
+  /retry after ([^.,;\]\n]+)/i,
+  /quotaResetDelay["'=:\s]+([^\s,"}\]]+)/i,
+];
 
 function toLowerText(value: string | undefined): string {
   return (value ?? '').toLowerCase();
 }
 
+function parseDurationToMilliseconds(text: string): number | null {
+  const durationRegex = /([\d.]+)\s*(ms|s|m|h)/gi;
+  let totalMs = 0;
+  let matched = false;
+
+  for (const match of text.matchAll(durationRegex)) {
+    matched = true;
+    const value = Number(match[1]);
+    if (!Number.isFinite(value)) {
+      return null;
+    }
+
+    const unit = match[2].toLowerCase() as keyof typeof DURATION_UNIT_TO_MS;
+    totalMs += value * DURATION_UNIT_TO_MS[unit];
+  }
+
+  if (!matched) {
+    return null;
+  }
+
+  return Math.round(totalMs);
+}
+
 function parseDurationToSeconds(text: string): number | null {
-  const match = text.match(/(?:(\d+)h)?(?:(\d+)m)?(?:(\d+(?:\.\d+)?)s)?(?:(\d+(?:\.\d+)?)ms)?/i);
-  if (!match) {
+  const milliseconds = parseDurationToMilliseconds(text);
+  if (milliseconds === null || milliseconds <= 0) {
     return null;
   }
-
-  const hours = Number(match[1] ?? 0);
-  const minutes = Number(match[2] ?? 0);
-  const seconds = Number(match[3] ?? 0);
-  const milliseconds = Number(match[4] ?? 0);
-
-  const totalSeconds =
-    hours * 3600 + minutes * 60 + Math.ceil(seconds) + Math.ceil(milliseconds / 1000);
-  if (totalSeconds <= 0) {
-    return null;
-  }
-  return totalSeconds;
+  return Math.ceil(milliseconds / 1000);
 }
 
 function tryParseGoogleErrorBody(body: string | undefined): ParsedGoogleErrorBody | null {
@@ -91,6 +118,107 @@ function mapGoogleReasonToTrackerReason(reason: string): RateLimitReason | null 
     return RateLimitReason.ModelCapacityExhausted;
   }
   return null;
+}
+
+function normalizeRetryHintKey(key: string): string {
+  return key.toLowerCase().replace(/[-_]/g, '');
+}
+
+function parseStructuredDurationObject(value: unknown): number | null {
+  if (!isObjectLike(value)) {
+    return null;
+  }
+
+  const obj = value as Record<string, unknown>;
+  const seconds = Number(obj.seconds ?? obj.Seconds ?? 0);
+  const nanos = Number(obj.nanos ?? obj.Nanos ?? 0);
+
+  if ((!Number.isFinite(seconds) || seconds <= 0) && (!Number.isFinite(nanos) || nanos <= 0)) {
+    return null;
+  }
+
+  return Math.round(Math.max(0, seconds) * 1000 + Math.max(0, nanos) / 1_000_000);
+}
+
+function parseStructuredDurationValue(value: unknown): number | null {
+  if (isString(value)) {
+    return parseDurationToMilliseconds(value);
+  }
+
+  if (isNumber(value) && value > 0) {
+    return Math.round(value * 1000);
+  }
+
+  return parseStructuredDurationObject(value);
+}
+
+function extractStructuredDelayRecursive(value: unknown, depth: number): number | null {
+  if (depth > MAX_RETRY_DELAY_SEARCH_DEPTH) {
+    return null;
+  }
+
+  if (isString(value)) {
+    return parseDurationToMilliseconds(value);
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const delay = extractStructuredDelayRecursive(item, depth + 1);
+      if (delay !== null) {
+        return delay;
+      }
+    }
+    return null;
+  }
+
+  if (!isObjectLike(value)) {
+    return null;
+  }
+
+  const durationObjectDelay = parseStructuredDurationObject(value);
+  if (durationObjectDelay !== null) {
+    return durationObjectDelay;
+  }
+
+  for (const [key, childValue] of Object.entries(value as Record<string, unknown>)) {
+    if (RETRY_HINT_KEYS.has(normalizeRetryHintKey(key))) {
+      const hintedDelay = parseStructuredDurationValue(childValue);
+      if (hintedDelay !== null) {
+        return hintedDelay;
+      }
+    }
+
+    const nestedDelay = extractStructuredDelayRecursive(childValue, depth + 1);
+    if (nestedDelay !== null) {
+      return nestedDelay;
+    }
+  }
+
+  return null;
+}
+
+export function parseRetryDelayMilliseconds(errorText: string | undefined): number | null {
+  if (!errorText) {
+    return null;
+  }
+
+  for (const pattern of QUOTA_RETRY_PATTERNS) {
+    const match = errorText.match(pattern);
+    if (match?.[1]) {
+      const delay = parseDurationToMilliseconds(match[1]);
+      if (delay !== null) {
+        return delay;
+      }
+    }
+  }
+
+  const parsedBody = tryParseGoogleErrorBody(errorText);
+  const delay = parsedBody ? extractStructuredDelayRecursive(parsedBody, 0) : null;
+  return delay;
+}
+
+export function shouldGraceRetry(delayMs: number): boolean {
+  return delayMs > 0 && delayMs <= GRACE_RETRY_WINDOW_MS;
 }
 
 export class RateLimitTracker {
@@ -353,6 +481,11 @@ export class RateLimitTracker {
     if (!body) {
       return null;
     }
+    const deepParsedRetry = parseRetryDelayMilliseconds(body);
+    if (deepParsedRetry !== null) {
+      return Math.ceil((deepParsedRetry + GRACE_RETRY_BUFFER_MS) / 1000);
+    }
+
     const parsedBody = tryParseGoogleErrorBody(body);
     const details = Array.isArray(parsedBody?.error?.details) ? parsedBody.error.details : [];
     for (const detail of details) {
@@ -363,10 +496,7 @@ export class RateLimitTracker {
         }
       }
 
-      if (
-        isString(detail.metadata?.retryDelay) &&
-        !isEmpty(detail.metadata.retryDelay.trim())
-      ) {
+      if (isString(detail.metadata?.retryDelay) && !isEmpty(detail.metadata.retryDelay.trim())) {
         const parsedDelay = parseDurationToSeconds(detail.metadata.retryDelay);
         if (parsedDelay !== null) {
           return parsedDelay;

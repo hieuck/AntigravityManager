@@ -176,13 +176,13 @@ export class ProtobufUtils {
   }
 
   static readString(data: Uint8Array): string {
-    const dec = new TextDecoder();
-    return dec.decode(data);
+    const decoder = new TextDecoder();
+    return decoder.decode(data);
   }
 
   static extractOAuthTokenInfo(
     data: Uint8Array,
-  ): { accessToken: string; refreshToken: string } | null {
+  ): { accessToken: string; refreshToken: string; idToken?: string } | null {
     // 1. Find Field 6 (OAuthTokenInfo)
     const field6Data = this.getField(data, 6);
     if (!field6Data) return null;
@@ -196,11 +196,13 @@ export class ProtobufUtils {
 
     const accessTokenBytes = this.getField(field6Data, 1);
     const refreshTokenBytes = this.getField(field6Data, 3);
+    const idTokenBytes = this.getField(field6Data, 5);
 
     if (accessTokenBytes && refreshTokenBytes) {
       return {
         accessToken: this.readString(accessTokenBytes),
         refreshToken: this.readString(refreshTokenBytes),
+        idToken: idTokenBytes ? this.readString(idTokenBytes) : undefined,
       };
     }
     return null;
@@ -211,26 +213,29 @@ export class ProtobufUtils {
     refreshToken: string,
     expiry: number,
   ): Uint8Array {
-    const f1 = this.createStringField(1, accessToken);
-    const f2 = this.createStringField(2, 'Bearer');
-    const f3 = this.createStringField(3, refreshToken);
-    const f4 = this.createTimestampField(4, expiry);
+    const accessTokenField = this.createStringField(1, accessToken);
+    const tokenTypeField = this.createStringField(2, 'Bearer');
+    const refreshTokenField = this.createStringField(3, refreshToken);
+    const expiryField = this.createTimestampField(4, expiry);
 
-    const combined = new Uint8Array(f1.length + f2.length + f3.length + f4.length);
-    combined.set(f1, 0);
-    combined.set(f2, f1.length);
-    combined.set(f3, f1.length + f2.length);
-    combined.set(f4, f1.length + f2.length + f3.length);
+    const oauthTokenInfoPayload = this.concatBytes(
+      accessTokenField,
+      tokenTypeField,
+      refreshTokenField,
+      expiryField,
+    );
 
     // Wrap as Field 6
-    const tag6 = (6 << 3) | 2;
-    const tag6Bytes = this.encodeVarint(tag6);
-    const lenBytes = this.encodeVarint(combined.length);
+    const oauthTokenInfoTag = (6 << 3) | 2;
+    const tagBytes = this.encodeVarint(oauthTokenInfoTag);
+    const lengthBytes = this.encodeVarint(oauthTokenInfoPayload.length);
 
-    const result = new Uint8Array(tag6Bytes.length + lenBytes.length + combined.length);
-    result.set(tag6Bytes, 0);
-    result.set(lenBytes, tag6Bytes.length);
-    result.set(combined, tag6Bytes.length + lenBytes.length);
+    const result = new Uint8Array(
+      tagBytes.length + lengthBytes.length + oauthTokenInfoPayload.length,
+    );
+    result.set(tagBytes, 0);
+    result.set(lengthBytes, tagBytes.length);
+    result.set(oauthTokenInfoPayload, tagBytes.length + lengthBytes.length);
 
     return result;
   }
@@ -239,53 +244,82 @@ export class ProtobufUtils {
     accessToken: string,
     refreshToken: string,
     expiry: number,
-    isGcpTos = true,
+    isGcpTos = false,
+    idToken?: string,
+    email?: string,
   ): Uint8Array {
-    const field1 = this.encodeStringField(1, accessToken);
-    const field2 = this.encodeStringField(2, 'Bearer');
-    const field3 = this.encodeStringField(3, refreshToken);
+    let shouldIncludeGcpTosFlag = isGcpTos;
+    if (email && this.isPersonalAccountEmail(email) && shouldIncludeGcpTosFlag) {
+      shouldIncludeGcpTosFlag = false;
+    }
 
-    const timestampTag = (1 << 3) | 0;
-    const tagBytes = this.encodeVarint(timestampTag);
-    const secondsBytes = this.encodeVarint(expiry);
-    const timestampMsg = new Uint8Array(tagBytes.length + secondsBytes.length);
-    timestampMsg.set(tagBytes, 0);
-    timestampMsg.set(secondsBytes, tagBytes.length);
+    const accessTokenField = this.encodeStringField(1, accessToken);
+    const tokenTypeField = this.encodeStringField(2, 'Bearer');
+    const refreshTokenField = this.encodeStringField(3, refreshToken);
 
-    const field4 = this.encodeLenDelimField(4, timestampMsg);
-    const field6 = isGcpTos ? this.encodeVarintField(6, 1) : new Uint8Array();
-
-    const combined = new Uint8Array(
-      field1.length + field2.length + field3.length + field4.length + field6.length,
+    const timestampMsg = this.concatBytes(
+      this.encodeVarintField(1, expiry),
+      this.encodeVarintField(2, 0),
     );
-    combined.set(field1, 0);
-    combined.set(field2, field1.length);
-    combined.set(field3, field1.length + field2.length);
-    combined.set(field4, field1.length + field2.length + field3.length);
-    combined.set(field6, field1.length + field2.length + field3.length + field4.length);
-    return combined;
+
+    const expiryField = this.encodeLenDelimField(4, timestampMsg);
+    const idTokenField = idToken ? this.encodeStringField(5, idToken) : new Uint8Array();
+    const gcpTosField = shouldIncludeGcpTosFlag
+      ? this.encodeVarintField(6, 1)
+      : new Uint8Array();
+
+    return this.concatBytes(
+      accessTokenField,
+      tokenTypeField,
+      refreshTokenField,
+      expiryField,
+      idTokenField,
+      gcpTosField,
+    );
   }
 
   static createUnifiedOAuthToken(
     accessToken: string,
     refreshToken: string,
     expiry: number,
-    isGcpTos = true,
+    isGcpTos = false,
+    idToken?: string,
+    email?: string,
   ): string {
-    const oauthInfo = this.createOAuthInfo(accessToken, refreshToken, expiry, isGcpTos);
+    const oauthInfo = this.createOAuthInfo(
+      accessToken,
+      refreshToken,
+      expiry,
+      isGcpTos,
+      idToken,
+      email,
+    );
     return this.createUnifiedStateEntry('oauthTokenInfoSentinelKey', oauthInfo);
+  }
+
+  private static isPersonalAccountEmail(email: string): boolean {
+    const lowerEmail = email.toLowerCase();
+    return (
+      lowerEmail.endsWith('@gmail.com') ||
+      lowerEmail.endsWith('@outlook.com') ||
+      lowerEmail.endsWith('@hotmail.com') ||
+      lowerEmail.endsWith('@qq.com') ||
+      lowerEmail.endsWith('@163.com')
+    );
   }
 
   static extractOAuthTokenInfoFromOAuthInfo(
     data: Uint8Array,
-  ): { accessToken: string; refreshToken: string } | null {
+  ): { accessToken: string; refreshToken: string; idToken?: string } | null {
     const accessTokenBytes = this.getField(data, 1);
     const refreshTokenBytes = this.getField(data, 3);
+    const idTokenBytes = this.getField(data, 5);
 
     if (accessTokenBytes && refreshTokenBytes) {
       return {
         accessToken: this.readString(accessTokenBytes),
         refreshToken: this.readString(refreshTokenBytes),
+        idToken: idTokenBytes ? this.readString(idTokenBytes) : undefined,
       };
     }
     return null;
@@ -293,7 +327,7 @@ export class ProtobufUtils {
 
   static extractOAuthTokenInfoFromUnifiedState(
     data: Uint8Array,
-  ): { accessToken: string; refreshToken: string } | null {
+  ): { accessToken: string; refreshToken: string; idToken?: string } | null {
     let decoded: { sentinelKey: string; payload: Uint8Array };
     try {
       decoded = this.decodeTopicRowPayload(data);
@@ -468,7 +502,7 @@ export class ProtobufUtils {
 
   static extractOAuthTokenInfoFromUnifiedStateEntry(
     outerB64: string,
-  ): { accessToken: string; refreshToken: string } | null {
+  ): { accessToken: string; refreshToken: string; idToken?: string } | null {
     return this.extractOAuthTokenInfoFromUnifiedState(
       new Uint8Array(Buffer.from(outerB64, 'base64')),
     );

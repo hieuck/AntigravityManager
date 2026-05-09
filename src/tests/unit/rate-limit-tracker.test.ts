@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { RateLimitReason, RateLimitTracker } from '../../server/modules/proxy/rate-limit-tracker';
+import {
+  parseRetryDelayMilliseconds,
+  RateLimitReason,
+  RateLimitTracker,
+  shouldGraceRetry,
+} from '../../server/modules/proxy/rate-limit-tracker';
 
 describe('RateLimitTracker parity replay', () => {
   it('uses Retry-After header before body/default', () => {
@@ -102,7 +107,28 @@ describe('RateLimitTracker parity replay', () => {
 
     expect(info).not.toBeNull();
     expect(info?.reason).toBe(RateLimitReason.ModelCapacityExhausted);
-    expect(info?.retryAfterSec).toBe(30);
+    expect(info?.retryAfterSec).toBe(32);
     expect(tracker.isRateLimited('acc-4')).toBe(true);
+  });
+
+  it('parses short retry hints for same-account grace retry', () => {
+    const retryDelayMs = parseRetryDelayMilliseconds(
+      JSON.stringify({
+        error: {
+          details: [
+            {
+              metadata: {
+                quotaResetDelay: '200ms',
+              },
+            },
+          ],
+        },
+      }),
+    );
+
+    expect(retryDelayMs).toBe(200);
+    expect(shouldGraceRetry(retryDelayMs ?? 0)).toBe(true);
+    expect(parseRetryDelayMilliseconds('retry after 1s')).toBe(1000);
+    expect(shouldGraceRetry(parseRetryDelayMilliseconds('retry after 1s') ?? 0)).toBe(true);
   });
 });

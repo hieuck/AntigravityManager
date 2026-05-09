@@ -83,6 +83,8 @@ describe('CloudMonitorService', () => {
     vi.mocked(CloudAccountRepo.getAccounts).mockResolvedValue(mockAccounts as never);
     vi.mocked(GoogleAPIService.refreshAccessToken).mockResolvedValue({
       access_token: 'new_token',
+      refresh_token: 'new_ref_token',
+      id_token: 'new_id_token',
       expires_in: 3600,
       token_type: 'Bearer',
     });
@@ -98,7 +100,14 @@ describe('CloudMonitorService', () => {
       undefined,
       undefined,
     );
-    expect(CloudAccountRepo.updateToken).toHaveBeenCalled();
+    expect(CloudAccountRepo.updateToken).toHaveBeenCalledWith(
+      'acc1',
+      expect.objectContaining({
+        access_token: 'new_token',
+        refresh_token: 'new_ref_token',
+        id_token: 'new_id_token',
+      }),
+    );
     expect(GoogleAPIService.fetchQuota).toHaveBeenCalledWith('new_token', undefined);
   });
 

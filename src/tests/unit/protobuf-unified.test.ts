@@ -1,6 +1,24 @@
 import { describe, it, expect } from 'vitest';
 import { ProtobufUtils } from '../../utils/protobuf';
 
+function hasVarintField(data: Uint8Array, fieldNum: number, expectedValue?: bigint): boolean {
+  let offset = 0;
+  while (offset < data.length) {
+    const { value: tag, nextOffset } = ProtobufUtils.readVarint(data, offset);
+    const wireType = Number(tag & 7n);
+    const currentField = Number(tag >> 3n);
+
+    if (currentField === fieldNum && wireType === 0) {
+      const { value } = ProtobufUtils.readVarint(data, nextOffset);
+      return expectedValue === undefined || value === expectedValue;
+    }
+
+    offset = ProtobufUtils.skipField(data, nextOffset, wireType);
+  }
+
+  return false;
+}
+
 describe('ProtobufUtils Unified OAuth', () => {
   it('should round-trip OAuthInfo payload', () => {
     const accessToken = 'access-token-123';
@@ -61,5 +79,42 @@ describe('ProtobufUtils Unified OAuth', () => {
 
     const parsed = ProtobufUtils.extractOAuthTokenInfoFromUnifiedState(legacyOuter);
     expect(parsed).toEqual({ accessToken, refreshToken });
+  });
+
+  it('writes id_token and timestamp nanos in OAuthInfo payload', () => {
+    const oauthInfo = ProtobufUtils.createOAuthInfo(
+      'access-token',
+      'refresh-token',
+      1700000000,
+      true,
+      'id-token-123',
+      'enterprise@example.com',
+    );
+    const idToken = ProtobufUtils.getField(oauthInfo, 5);
+    const timestamp = ProtobufUtils.getField(oauthInfo, 4);
+
+    expect(idToken ? ProtobufUtils.readString(idToken) : null).toBe('id-token-123');
+    expect(timestamp).not.toBeNull();
+    expect(hasVarintField(timestamp!, 1, 1700000000n)).toBe(true);
+    expect(hasVarintField(timestamp!, 2, 0n)).toBe(true);
+  });
+
+  it('omits GCP TOS field for personal account emails', () => {
+    const oauthInfo = ProtobufUtils.createOAuthInfo(
+      'access-token',
+      'refresh-token',
+      1700000000,
+      true,
+      undefined,
+      'user@gmail.com',
+    );
+
+    expect(hasVarintField(oauthInfo, 6, 1n)).toBe(false);
+  });
+
+  it('defaults to omitting GCP TOS field', () => {
+    const oauthInfo = ProtobufUtils.createOAuthInfo('access-token', 'refresh-token', 1700000000);
+
+    expect(hasVarintField(oauthInfo, 6, 1n)).toBe(false);
   });
 });

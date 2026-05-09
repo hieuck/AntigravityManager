@@ -173,7 +173,6 @@ describe('GoogleAPIService user info parsing', () => {
         id: 'google-user-1',
         email: 'user@example.com',
         name: 'Example User',
-        family_name: undefined,
       }),
     );
   });
@@ -249,9 +248,8 @@ describe('GoogleAPIService fetchQuota fallback policy', () => {
     } as any);
 
     const { GoogleAPIService } = await import('../../services/GoogleAPIService');
-    const { FALLBACK_VERSION, resolveLocalInstalledVersion } = await import(
-      '../../server/modules/proxy/request-user-agent'
-    );
+    const { FALLBACK_VERSION, resolveLocalInstalledVersion } =
+      await import('../../server/modules/proxy/request-user-agent');
     const expectedVersion = resolveLocalInstalledVersion() ?? FALLBACK_VERSION;
 
     await expect(GoogleAPIService.fetchAICredits('access-token')).resolves.toEqual({
@@ -279,13 +277,11 @@ describe('GoogleAPIService fetchQuota fallback policy', () => {
   });
 
   it('does not fall through to the next endpoint on permanent 400 errors', async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce({
-        ok: false,
-        status: 400,
-        text: vi.fn().mockResolvedValue('INVALID_ARGUMENT'),
-      });
+    const fetchMock = vi.fn().mockResolvedValueOnce({
+      ok: false,
+      status: 400,
+      text: vi.fn().mockResolvedValue('INVALID_ARGUMENT'),
+    });
 
     vi.stubGlobal('fetch', fetchMock);
 
@@ -308,6 +304,94 @@ describe('GoogleAPIService fetchQuota fallback policy', () => {
       'HTTP 400 - INVALID_ARGUMENT',
     );
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries quota on the same endpoint without project after project 403', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 403,
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: vi.fn().mockResolvedValue({
+          models: {
+            'gemini-2.5-flash': {
+              quotaInfo: {
+                remainingFraction: 0.42,
+                resetTime: '2026-05-05T00:00:00Z',
+              },
+            },
+          },
+        }),
+      });
+
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { ConfigManager } = await import('../../ipc/config/manager');
+    vi.spyOn(ConfigManager, 'loadConfig').mockReturnValue({
+      proxy: {
+        upstream_proxy: {
+          enabled: false,
+        },
+      },
+    } as any);
+
+    const { GoogleAPIService } = await import('../../services/GoogleAPIService');
+    vi.spyOn(GoogleAPIService, 'fetchProjectContext').mockResolvedValue({
+      projectId: 'project-1',
+      subscriptionTier: 'free',
+    });
+
+    await expect(GoogleAPIService.fetchQuota('access-token')).resolves.toMatchObject({
+      is_forbidden: false,
+      models: {
+        'gemini-2.5-flash': {
+          percentage: 42,
+          resetTime: '2026-05-05T00:00:00Z',
+        },
+      },
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(fetchMock.mock.calls[0]?.[0]);
+    expect(fetchMock.mock.calls[0]?.[1]?.body).toBe(JSON.stringify({ project: 'project-1' }));
+    expect(fetchMock.mock.calls[1]?.[1]?.body).toBe(JSON.stringify({}));
+  });
+
+  it('keeps forbidden behavior when quota still returns 403 without project', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 403,
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 403,
+      });
+
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { ConfigManager } = await import('../../ipc/config/manager');
+    vi.spyOn(ConfigManager, 'loadConfig').mockReturnValue({
+      proxy: {
+        upstream_proxy: {
+          enabled: false,
+        },
+      },
+    } as any);
+
+    const { GoogleAPIService } = await import('../../services/GoogleAPIService');
+    vi.spyOn(GoogleAPIService, 'fetchProjectContext').mockResolvedValue({
+      projectId: 'project-1',
+      subscriptionTier: 'free',
+    });
+
+    await expect(GoogleAPIService.fetchQuota('access-token')).rejects.toThrow('FORBIDDEN');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it('uses an explicit dispatcher from env proxy settings when no account proxy is provided', async () => {
@@ -405,9 +489,11 @@ describe('QuotaService fallback policy', () => {
         create: vi.fn(() => ({
           post: postMock,
         })),
-        isAxiosError: (error: unknown) => Boolean((error as { isAxiosError?: boolean })?.isAxiosError),
+        isAxiosError: (error: unknown) =>
+          Boolean((error as { isAxiosError?: boolean })?.isAxiosError),
       },
-      isAxiosError: (error: unknown) => Boolean((error as { isAxiosError?: boolean })?.isAxiosError),
+      isAxiosError: (error: unknown) =>
+        Boolean((error as { isAxiosError?: boolean })?.isAxiosError),
     }));
 
     const { QuotaService } = await import('../../lib/antigravity/QuotaService');
@@ -416,5 +502,69 @@ describe('QuotaService fallback policy', () => {
       'HTTP 400 - {"error":"INVALID_ARGUMENT"}',
     );
     expect(postMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries legacy QuotaService on the same endpoint without project after project 403', async () => {
+    const postMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        status: 200,
+        data: {
+          cloudaicompanionProject: 'project-1',
+          currentTier: { id: 'free' },
+        },
+      })
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: {
+          status: 403,
+          data: { error: 'PERMISSION_DENIED' },
+        },
+        message: 'Request failed with status code 403',
+      })
+      .mockResolvedValueOnce({
+        status: 200,
+        data: {
+          models: {
+            'gemini-3-flash': {
+              quotaInfo: {
+                remainingFraction: 0.7,
+                resetTime: '2026-05-05T00:00:00Z',
+              },
+            },
+          },
+        },
+      });
+
+    vi.doMock('axios', () => ({
+      default: {
+        create: vi.fn(() => ({
+          post: postMock,
+        })),
+        isAxiosError: (error: unknown) =>
+          Boolean((error as { isAxiosError?: boolean })?.isAxiosError),
+      },
+      isAxiosError: (error: unknown) =>
+        Boolean((error as { isAxiosError?: boolean })?.isAxiosError),
+    }));
+
+    const { QuotaService } = await import('../../lib/antigravity/QuotaService');
+
+    await expect(QuotaService.fetchQuota('access-token', 'user@example.com')).resolves.toEqual({
+      quotaData: {
+        models: {
+          'gemini-3-flash': {
+            percentage: 70,
+            resetTime: '2026-05-05T00:00:00Z',
+          },
+        },
+        isForbidden: false,
+        subscriptionTier: 'free',
+      },
+      projectId: 'project-1',
+    });
+    expect(postMock).toHaveBeenCalledTimes(3);
+    expect(postMock.mock.calls[1]?.[1]).toEqual({ project: 'project-1' });
+    expect(postMock.mock.calls[2]?.[1]).toEqual({});
   });
 });
